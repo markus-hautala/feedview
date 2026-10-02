@@ -10,6 +10,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(FEEDVIEW_BUILD_TEST_SENDER "Build the test-pattern NDI sender tool" ON)
+option(FEEDVIEW_BUILD_TESTS "Build the display-handling scenario tests (run with ctest)" ON)
 
 # Windows: link the C runtime statically so users don't need the VC++ redistributable.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -67,12 +68,16 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # ---- The app
+# ---- Display handling logic (no SDL dependency, unit-tested)
+add_library(display_manager STATIC src/display_manager.cpp)
+target_include_directories(display_manager PUBLIC src)
+
 add_executable(feedview WIN32 MACOSX_BUNDLE
   src/main.cpp
   src/ndi_io.cpp
   src/settings.cpp
   ${FONT_CPP})
-target_link_libraries(feedview PRIVATE ndi_runtime imgui SDL3::SDL3)
+target_link_libraries(feedview PRIVATE ndi_runtime display_manager imgui SDL3::SDL3)
 target_compile_definitions(feedview PRIVATE FEEDVIEW_VERSION="${PROJECT_VERSION}")
 set_target_properties(feedview PROPERTIES OUTPUT_NAME ${APP_NAME})
 if(MSVC)
@@ -101,7 +106,14 @@ if(FEEDVIEW_BUILD_TEST_SENDER)
   endif()
 endif()
 
-foreach(t feedview ndi_runtime feedview_test_sender)
+if(FEEDVIEW_BUILD_TESTS)
+  enable_testing()
+  add_executable(display_manager_test tests/display_manager_test.cpp)
+  target_link_libraries(display_manager_test PRIVATE display_manager)
+  add_test(NAME display_manager COMMAND display_manager_test)
+endif()
+
+foreach(t feedview ndi_runtime display_manager display_manager_test feedview_test_sender)
   if(TARGET ${t})
     if(MSVC)
       target_compile_options(${t} PRIVATE /W3)

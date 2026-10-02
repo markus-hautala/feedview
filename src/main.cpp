@@ -10,6 +10,7 @@
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlrenderer3.h"
 
+#include "display_manager.h"
 #include "ndi_io.h"
 #include "ndi_runtime.h"
 #include "settings.h"
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -39,6 +41,10 @@ extern const unsigned int kUiFontDataSize;
 namespace {
 
 constexpr const char* kAppName = "FeedView";
+
+#ifndef FEEDVIEW_IDENTIFY_MIN_DISPLAYS
+#define FEEDVIEW_IDENTIFY_MIN_DISPLAYS 2  // tests on a single-screen machine build with 1
+#endif
 constexpr double kOverlayHideSeconds = 3.0;
 
 // ---------------------------------------------------------------------------------------
@@ -65,7 +71,7 @@ const char* kUsage =
     "\n"
     "  --source NAME       Connect to this NDI source, e.g. \"STUDIO-PC (Program)\"\n"
     "  --fullscreen, -f    Start in fullscreen\n"
-    "  --display N         Fullscreen on display N (1 = first display)\n"
+    "  --display N         Fullscreen on display N (numbered left to right, 1 = leftmost)\n"
     "  --extra-ips LIST    Comma separated IPs to search for sources on other subnets\n"
     "  --volume N          Volume 0-100\n"
     "  --mute              Start muted\n"
@@ -74,7 +80,8 @@ const char* kUsage =
     "  --help              Show this help\n"
     "\n"
     "Keys: F/F11 fullscreen, Esc leave fullscreen, 1-9 pick source, 0 disconnect,\n"
-    "      M mute, Up/Down volume, I info overlay.\n";
+    "      D show display numbers (then click one or press its number),\n"
+    "      Ctrl+1-9 fullscreen on display N, M mute, Up/Down volume, I info overlay.\n";
 
 Options parseArgs(int argc, char** argv) {
     Options o;
@@ -289,6 +296,266 @@ void sameLineIfFits(float width) {
     if (ImGui::GetContentRegionAvail().x < width) ImGui::NewLine();
 }
 
+// ---------------------------------------------------------------------------------------
+// UI scale (follows the monitor the window is on)
+
+float contentScaleFor(SDL_Window* w) {
+    SDL_DisplayID d = w ? SDL_GetDisplayForWindow(w) : 0;
+    float s = d ? SDL_GetDisplayContentScale(d) : 0.0f;
+    if (s <= 0.0f) s = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    return std::max(1.0f, s);
+}
+
+void applyUiStyle(float scale) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();
+    ImGui::StyleColorsDark(&style);
+    style.WindowRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.PopupRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowBorderSize = 0.0f;
+    style.FramePadding = ImVec2(8, 5);
+    style.ItemSpacing = ImVec2(8, 6);
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.10f, 0.86f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.12f, 0.97f);
+    style.ScaleAllSizes(scale);
+    style.FontScaleDpi = scale;
+    style.FontSizeBase = 16.0f;
+}
+
+// ---------------------------------------------------------------------------------------
+// SDL side of the display manager
+
+class SdlDisplayPlatform : public DisplayPlatform {
+public:
+    SdlDisplayPlatform(SDL_Window* w, std::function<void(const std::string&)> notify)
+        : w_(w), notify_(std::move(notify)) {}
+
+    std::vector<DisplayInfo> displays() override {
+        std::vector<DisplayInfo> out;
+        int n = 0;
+        if (SDL_DisplayID* ids = SDL_GetDisplays(&n)) {
+            for (int i = 0; i < n; ++i) {
+                SDL_Rect r{};
+                if (!SDL_GetDisplayBounds(ids[i], &r)) continue;
+                const char* nm = SDL_GetDisplayName(ids[i]);
+                DisplayInfo d;
+                d.id = ids[i];
+                d.name = (nm && *nm) ? nm : "Display";
+                d.bounds = {r.x, r.y, r.w, r.h};
+                out.push_back(d);
+            }
+            SDL_free(ids);
+        }
+        return out;
+    }
+    bool windowFullscreen() override { return (SDL_GetWindowFlags(w_) & SDL_WINDOW_FULLSCREEN) != 0; }
+    uint32_t windowDisplay() override { return SDL_GetDisplayForWindow(w_); }
+    DisplayRect windowRect() override {
+        int x = 0, y = 0, ww = 0, hh = 0;
+        SDL_GetWindowPosition(w_, &x, &y);
+        SDL_GetWindowSize(w_, &ww, &hh);
+        return {x, y, ww, hh};
+    }
+    void enterFullscreen(uint32_t id) override {
+        // Leave first, so a changed resolution/arrangement is picked up cleanly.
+        if (windowFullscreen()) {
+            SDL_SetWindowFullscreen(w_, false);
+            SDL_SyncWindow(w_);
+        }
+        SDL_SetWindowPosition(w_, SDL_WINDOWPOS_CENTERED_DISPLAY(id), SDL_WINDOWPOS_CENTERED_DISPLAY(id));
+        SDL_SyncWindow(w_);
+        SDL_SetWindowFullscreenMode(w_, nullptr);  // borderless "desktop" fullscreen
+        SDL_SetWindowFullscreen(w_, true);
+        SDL_SyncWindow(w_);
+    }
+    void leaveFullscreen() override {
+        SDL_SetWindowFullscreen(w_, false);
+        SDL_SyncWindow(w_);
+    }
+    void moveWindowTo(uint32_t id) override {
+        if (windowFullscreen()) leaveFullscreen();
+        SDL_Rect b{};
+        int ww = 0, hh = 0;
+        SDL_GetWindowSize(w_, &ww, &hh);
+        if (SDL_GetDisplayUsableBounds(id, &b) && b.w > 0 && (ww > b.w * 9 / 10 || hh > b.h * 9 / 10)) {
+            ww = b.w * 2 / 3;  // keep it a manageable window on a smaller screen
+            hh = ww * 9 / 16;
+            SDL_SetWindowSize(w_, ww, hh);
+        }
+        SDL_SetWindowPosition(w_, SDL_WINDOWPOS_CENTERED_DISPLAY(id), SDL_WINDOWPOS_CENTERED_DISPLAY(id));
+        SDL_SyncWindow(w_);
+    }
+    void notify(const std::string& m) override { notify_(m); }
+
+private:
+    SDL_Window* w_;
+    std::function<void(const std::string&)> notify_;
+};
+
+// ---------------------------------------------------------------------------------------
+// "Identify": a big number on every screen. Click one (or press its number) to put
+// FeedView fullscreen there. The screen FeedView already fills shows the same card inside
+// the main window instead, because a fullscreen window can sit above "always on top" ones.
+
+class IdentifyOverlay {
+public:
+    ~IdentifyOverlay() { hide(); }
+    bool active() const { return !items_.empty() || skipIndex_ >= 0; }
+    int skipIndex() const { return skipIndex_; }
+
+    void show(const std::vector<DisplayInfo>& list, int targetIndex, SDL_DisplayID skip, Uint64 now) {
+        hide();
+        for (int i = 0; i < int(list.size()); ++i) {
+            const DisplayInfo& d = list[i];
+            if (d.id == skip) {
+                skipIndex_ = i;
+                continue;
+            }
+            const float scale = std::max(1.0f, SDL_GetDisplayContentScale(d.id));
+            const int w = std::min(int(480 * scale), d.bounds.w * 3 / 4);
+            const int h = w * 5 / 8;
+            SDL_Window* win = SDL_CreateWindow("FeedView display", w, h,
+                                               SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_UTILITY |
+                                                   SDL_WINDOW_NOT_FOCUSABLE | SDL_WINDOW_HIDDEN);
+            if (!win) continue;
+            SDL_SetWindowPosition(win, d.bounds.x + (d.bounds.w - w) / 2, d.bounds.y + (d.bounds.h - h) / 2);
+            SDL_Renderer* r = SDL_CreateRenderer(win, SDL_SOFTWARE_RENDERER);
+            if (!r) {
+                SDL_DestroyWindow(win);
+                continue;
+            }
+            SDL_ShowWindow(win);
+            items_.push_back({win, r, i, d.name, resolution(d), i == targetIndex});
+        }
+        targetIndex_ = targetIndex;
+        until_ = now + 10000;
+    }
+    void hide() {
+        for (auto& it : items_) {
+            SDL_DestroyRenderer(it.r);
+            SDL_DestroyWindow(it.w);
+        }
+        items_.clear();
+        skipIndex_ = -1;
+    }
+    void update(Uint64 now) {
+        if (active() && now > until_) hide();
+    }
+    int hitTest(SDL_WindowID id) const {
+        for (const auto& it : items_)
+            if (SDL_GetWindowID(it.w) == id) return it.index;
+        return -1;
+    }
+    void render() {
+        for (auto& it : items_) drawCard(it);
+    }
+    static std::string resolution(const DisplayInfo& d) {
+        return std::to_string(d.bounds.w) + " x " + std::to_string(d.bounds.h);
+    }
+
+private:
+    struct Item {
+        SDL_Window* w;
+        SDL_Renderer* r;
+        int index;
+        std::string name, res;
+        bool target;
+    };
+
+    static void drawCard(Item& it) {
+        SDL_Renderer* r = it.r;
+        int w = 0, h = 0;
+        SDL_SetRenderScale(r, 1, 1);
+        SDL_GetCurrentRenderOutputSize(r, &w, &h);
+        if (it.target)
+            SDL_SetRenderDrawColor(r, 28, 98, 190, 255);
+        else
+            SDL_SetRenderDrawColor(r, 24, 26, 30, 255);
+        SDL_RenderClear(r);
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        for (int k = 0; k < 4; ++k) {
+            SDL_FRect border{float(k), float(k), float(w - 2 * k), float(h - 2 * k)};
+            SDL_RenderRect(r, &border);
+        }
+        const std::string num = std::to_string(it.index + 1);
+        const float glyph = SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE;
+        const float big = std::floor(h * 0.42f / glyph);
+        SDL_SetRenderScale(r, big, big);
+        SDL_RenderDebugText(r, (w / big - glyph * num.size()) / 2, h * 0.08f / big, num.c_str());
+        const float small = std::max(1.0f, std::floor(h / 140.0f));
+        SDL_SetRenderScale(r, small, small);
+        auto line = [&](std::string t, float y) {
+            const size_t maxChars = size_t(std::max(4.0f, (w / small - 16) / glyph));
+            if (t.size() > maxChars) t = t.substr(0, maxChars - 2) + "..";
+            SDL_RenderDebugText(r, (w / small - glyph * t.size()) / 2, y / small, t.c_str());
+        };
+        line(it.name, h * 0.56f);
+        line(it.res, h * 0.56f + 12 * small);
+        line(it.target ? "FeedView's display" : "", h * 0.56f + 24 * small);
+        line("Click here or press " + num, h - 22 * small);
+        SDL_RenderPresent(r);
+    }
+
+    std::vector<Item> items_;
+    int skipIndex_ = -1;
+    int targetIndex_ = -1;
+    Uint64 until_ = 0;
+};
+
+struct CardRect {
+    ImVec2 a, b;
+    bool contains(ImVec2 p) const { return p.x >= a.x && p.x < b.x && p.y >= a.y && p.y < b.y; }
+};
+
+// Same card, drawn inside the main window (ImGui) for the screen FeedView already fills.
+// Returns the card rectangle so clicks on it can be detected.
+CardRect identifyCardInWindow(ImVec2 view, float uiScale, int number, const DisplayInfo& d, bool isTarget) {
+    const float w = std::min(view.x * 0.75f, 480.0f * uiScale), h = w * 5 / 8;
+    const ImVec2 a((view.x - w) * 0.5f, (view.y - h) * 0.5f), b(a.x + w, a.y + h);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(a, b, isTarget ? IM_COL32(28, 98, 190, 255) : IM_COL32(24, 26, 30, 255), 8.0f);
+    dl->AddRect(a, b, IM_COL32(255, 255, 255, 255), 8.0f, 0, 4.0f);
+    const std::string num = std::to_string(number);
+    centeredText(dl, ImVec2(view.x * 0.5f, a.y + h * 0.3f), num.c_str(), h * 0.42f / ImGui::GetFontSize(),
+                 IM_COL32(255, 255, 255, 255));
+    const std::string res = IdentifyOverlay::resolution(d);
+    centeredText(dl, ImVec2(view.x * 0.5f, a.y + h * 0.62f), d.name.c_str(), 1.2f, IM_COL32(255, 255, 255, 255));
+    centeredText(dl, ImVec2(view.x * 0.5f, a.y + h * 0.62f + ImGui::GetFontSize() * 1.5f), res.c_str(), 1.0f,
+                 IM_COL32(220, 220, 220, 255));
+    const std::string hint = "Click here or press " + num;
+    centeredText(dl, ImVec2(view.x * 0.5f, b.y - ImGui::GetFontSize() * 1.4f), hint.c_str(), 1.0f,
+                 IM_COL32(220, 220, 220, 255));
+    return CardRect{a, b};
+}
+
+// ---------------------------------------------------------------------------------------
+// Short on-screen notices ("Display 2 is back - fullscreen restored")
+
+struct Toast {
+    std::string text;
+    Uint64 until;
+};
+
+void drawToasts(std::vector<Toast>& toasts, Uint64 now, ImVec2 view, float top, float uiScale) {
+    toasts.erase(std::remove_if(toasts.begin(), toasts.end(), [&](const Toast& t) { return now > t.until; }),
+                 toasts.end());
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float pad = 10.0f * uiScale;
+    float y = top;
+    for (const auto& t : toasts) {
+        ImVec2 ts = ImGui::CalcTextSize(t.text.c_str(), nullptr, false, view.x - 6 * pad);
+        ImVec2 a(std::floor((view.x - ts.x) * 0.5f - pad), y);
+        ImVec2 b(a.x + ts.x + 2 * pad, a.y + ts.y + 2 * pad * 0.7f);
+        dl->AddRectFilled(a, b, IM_COL32(20, 22, 26, 235), 6.0f * uiScale);
+        dl->AddRect(a, b, IM_COL32(90, 150, 230, 255), 6.0f * uiScale, 0, 1.5f * uiScale);
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(a.x + pad, a.y + pad * 0.7f),
+                    IM_COL32(240, 240, 240, 255), t.text.c_str(), nullptr, view.x - 6 * pad);
+        y = b.y + pad * 0.6f;
+    }
+}
+
 int listSourcesAndExit(NdiRuntime& runtime, const Options& opt, const Settings& settings) {
     if (!runtime.loaded()) {
         std::fprintf(stderr, "NDI runtime not found. %s\nDownload: %s\n", runtime.error().c_str(),
@@ -327,6 +594,10 @@ int main(int argc, char** argv) {
 
     SDL_SetAppMetadata(kAppName, FEEDVIEW_VERSION, "app.feedview.player");
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
+    // macOS: plain (non-Spaces) fullscreen switches instantly and stays on its screen, and
+    // a click on an inactive window acts immediately - both matter during a live event.
+    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
 
     // ---- Settings
     std::string settingsPath;
@@ -341,7 +612,6 @@ int main(int argc, char** argv) {
     if (opt.extraIpsSet) settings.extraIps = opt.extraIps;
     if (opt.volume >= 0) settings.volume = opt.volume;
     if (opt.mute) settings.muted = true;
-    if (opt.display >= 0) settings.display = opt.display;
 
     // ---- NDI runtime
     const char* base = SDL_GetBasePath();
@@ -361,7 +631,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const float uiScale = std::max(1.0f, SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay()));
+    float uiScale = contentScaleFor(nullptr);
     SDL_Window* window = SDL_CreateWindow(kAppName, int(960 * uiScale), int(540 * uiScale),
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
@@ -375,30 +645,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_SetRenderVSync(renderer, 1);
+    const SDL_WindowID mainWindowId = SDL_GetWindowID(window);
 
     // ---- ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
+    applyUiStyle(uiScale);
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.PopupRounding = 6.0f;
-    style.GrabRounding = 4.0f;
-    style.WindowBorderSize = 0.0f;
-    style.FramePadding = ImVec2(8, 5);
-    style.ItemSpacing = ImVec2(8, 6);
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.10f, 0.86f);
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.10f, 0.11f, 0.12f, 0.97f);
-    style.ScaleAllSizes(uiScale);
-    style.FontScaleDpi = uiScale;
     {
         ImFontConfig cfg;
         cfg.FontDataOwnedByAtlas = false;
         io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(kUiFontData), int(kUiFontDataSize), 16.0f, &cfg);
-        style.FontSizeBase = 16.0f;
     }
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
@@ -443,53 +702,44 @@ int main(int argc, char** argv) {
     };
     if (receiver && !settings.source.empty()) selectSource(settings.source);
 
-    // ---- Displays / fullscreen
-    std::vector<SDL_DisplayID> displays;
-    std::vector<std::string> displayNames;
-    auto refreshDisplays = [&]() {
-        displays.clear();
-        displayNames.clear();
-        int n = 0;
-        if (SDL_DisplayID* ids = SDL_GetDisplays(&n)) {
-            for (int i = 0; i < n; ++i) {
-                displays.push_back(ids[i]);
-                const char* nm = SDL_GetDisplayName(ids[i]);
-                SDL_Rect r{};
-                SDL_GetDisplayBounds(ids[i], &r);
-                char buf[160];
-                std::snprintf(buf, sizeof buf, "%d: %s (%dx%d)", i + 1, nm ? nm : "Display", r.w, r.h);
-                displayNames.emplace_back(buf);
-            }
-            SDL_free(ids);
-        }
+    // ---- Displays / fullscreen (see display_manager.h for the behaviour)
+    std::vector<Toast> toasts;
+    auto notify = [&](const std::string& m) {
+        SDL_Log("%s", m.c_str());
+        toasts.push_back({m, SDL_GetTicks() + 6000});
+        if (toasts.size() > 3) toasts.erase(toasts.begin());
     };
-    refreshDisplays();
+    SdlDisplayPlatform platform(window, notify);
+    DisplayManager dm(platform);
+    dm.setTarget({settings.displayName, settings.displayNth, settings.displayIndex});
+    if (opt.display >= 0) dm.setTarget({std::string(), 0, opt.display});  // --display N
+    IdentifyOverlay identify;
 
-    auto isFullscreen = [&]() { return (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0; };
-    auto setFullscreen = [&](bool on) {
-        if (!on) {
-            SDL_SetWindowFullscreen(window, false);
+    auto toggleIdentify = [&]() {
+        if (identify.active()) {
+            identify.hide();
             return;
         }
-        if (!displays.empty()) {
-            int idx = std::clamp(settings.display, 0, int(displays.size()) - 1);
-            SDL_DisplayID target = displays[idx];
-            if (SDL_GetDisplayForWindow(window) != target) {
-                if (isFullscreen()) {
-                    SDL_SetWindowFullscreen(window, false);
-                    SDL_SyncWindow(window);
-                }
-                SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(target),
-                                      SDL_WINDOWPOS_CENTERED_DISPLAY(target));
-                SDL_SyncWindow(window);
-            }
+        if (int(dm.displays().size()) < FEEDVIEW_IDENTIFY_MIN_DISPLAYS) {
+            notify("Only one display is connected");
+            return;
         }
-        SDL_SetWindowFullscreenMode(window, nullptr);  // borderless "desktop" fullscreen
-        SDL_SetWindowFullscreen(window, true);
+        const SDL_DisplayID here = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) ? SDL_GetDisplayForWindow(window) : 0;
+        identify.show(dm.displays(), dm.targetIndex(), here, SDL_GetTicks());
+        notify("Click a screen's card or press its number to show FeedView there (Esc cancels)");
     };
 
     SDL_ShowWindow(window);
-    if (opt.fullscreen || settings.startFullscreen) setFullscreen(true);
+    dm.start(SDL_GetTicks(), opt.fullscreen || settings.startFullscreen);
+    if (dm.target().name.empty() && dm.targetIndex() >= 0) {
+        // --display N or an older settings file: from now on remember it by name.
+        const int ti = dm.targetIndex();
+        const DisplayInfo& d = dm.displays()[ti];
+        dm.setTarget({d.name, d.nth, ti});
+    }
+    uiScale = contentScaleFor(window);
+    applyUiStyle(uiScale);
+    bool rescaleUi = false;
 
     // ---- Main loop
     bool running = true;
@@ -527,7 +777,28 @@ int main(int argc, char** argv) {
                     break;
                 case SDL_EVENT_DISPLAY_ADDED:
                 case SDL_EVENT_DISPLAY_REMOVED:
-                    refreshDisplays();
+                case SDL_EVENT_DISPLAY_MOVED:
+                case SDL_EVENT_DISPLAY_ORIENTATION:
+                case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
+                case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+                    dm.displaysChanged(SDL_GetTicks());
+                    identify.hide();  // its cards may now sit on the wrong screens
+                    rescaleUi = true;
+                    break;
+                case SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED:
+                    rescaleUi = true;
+                    break;
+                case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+                    if (e.window.windowID == mainWindowId) {
+                        dm.windowDisplayChanged(SDL_GetTicks());
+                        rescaleUi = true;
+                    }
+                    break;
+                case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+                    if (e.window.windowID == mainWindowId) rescaleUi = true;
+                    break;
+                case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+                    if (e.window.windowID == mainWindowId) dm.windowLeftFullscreen(SDL_GetTicks());
                     break;
                 case SDL_EVENT_MOUSE_MOTION:
                 case SDL_EVENT_MOUSE_WHEEL:
@@ -535,17 +806,45 @@ int main(int argc, char** argv) {
                     break;
                 case SDL_EVENT_MOUSE_BUTTON_DOWN:
                     lastActivity = SDL_GetTicks();
-                    if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2 && !io.WantCaptureMouse)
-                        setFullscreen(!isFullscreen());
+                    if (e.button.windowID != mainWindowId) {
+                        const int idx = identify.hitTest(e.button.windowID);
+                        if (idx >= 0) {
+                            identify.hide();
+                            dm.chooseDisplay(idx, true, SDL_GetTicks());
+                        }
+                    } else if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2 && !io.WantCaptureMouse &&
+                               !identify.active()) {
+                        dm.toggleFullscreen(SDL_GetTicks());
+                    }
                     break;
                 case SDL_EVENT_KEY_DOWN: {
                     const bool volumeKey = e.key.key == SDLK_UP || e.key.key == SDLK_DOWN;
                     if (io.WantTextInput || (e.key.repeat && !volumeKey)) break;
                     const SDL_Keycode k = e.key.key;
-                    if (k == SDLK_F || k == SDLK_F11) {
-                        setFullscreen(!isFullscreen());
+                    const SDL_Scancode sc = e.key.scancode;
+                    const bool cmd = (e.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0;
+                    const Uint64 t = SDL_GetTicks();
+                    // Digits by physical key, so they work the same on every keyboard layout.
+                    int digit = -1;
+                    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) digit = int(sc - SDL_SCANCODE_1) + 1;
+                    else if (sc >= SDL_SCANCODE_KP_1 && sc <= SDL_SCANCODE_KP_9) digit = int(sc - SDL_SCANCODE_KP_1) + 1;
+                    else if (sc == SDL_SCANCODE_0 || sc == SDL_SCANCODE_KP_0) digit = 0;
+
+                    if (digit >= 1 && (cmd || identify.active())) {
+                        identify.hide();  // Ctrl/Cmd+N, or N while the display numbers are shown
+                        dm.chooseDisplay(digit - 1, true, t);
+                    } else if (digit == 0) {
+                        if (identify.active()) identify.hide();
+                        else if (!cmd) selectSource("");
+                    } else if (digit >= 1) {
+                        if (size_t(digit - 1) < sources.size()) selectSource(sources[digit - 1].name);
+                    } else if (k == SDLK_D) {
+                        toggleIdentify();
+                    } else if (k == SDLK_F || k == SDLK_F11) {
+                        dm.toggleFullscreen(t);
                     } else if (k == SDLK_ESCAPE) {
-                        if (isFullscreen()) setFullscreen(false);
+                        if (identify.active()) identify.hide();
+                        else if (dm.wantFullscreen()) dm.setFullscreen(false, t);
                     } else if (k == SDLK_M) {
                         settings.muted = !settings.muted;
                         lastActivity = SDL_GetTicks();
@@ -555,11 +854,6 @@ int main(int argc, char** argv) {
                         lastActivity = SDL_GetTicks();
                     } else if (k == SDLK_I) {
                         settings.showInfo = !settings.showInfo;
-                    } else if (k == SDLK_0) {
-                        selectSource("");
-                    } else if (k >= SDLK_1 && k <= SDLK_9) {
-                        size_t idx = size_t(k - SDLK_1);
-                        if (idx < sources.size()) selectSource(sources[idx].name);
                     }
                     break;
                 }
@@ -568,6 +862,26 @@ int main(int argc, char** argv) {
             }
         }
         if (!running) break;
+
+        // ---- Keep the window on the right screen; follow DPI when it moves between monitors
+        {
+            const Uint64 t = SDL_GetTicks();
+            dm.update(t);
+            identify.update(t);
+            identify.render();
+            const DisplayTarget& dt = dm.target();
+            settings.displayName = dt.name;
+            settings.displayNth = dt.nth;
+            settings.displayIndex = dt.index;
+            if (rescaleUi) {
+                rescaleUi = false;
+                const float s = contentScaleFor(window);
+                if (std::fabs(s - uiScale) > 0.01f) {
+                    uiScale = s;
+                    applyUiStyle(uiScale);
+                }
+            }
+        }
 
         if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
             SDL_Delay(20);
@@ -604,10 +918,11 @@ int main(int argc, char** argv) {
 
         const Uint64 now = SDL_GetTicks();
         const bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-        const bool showOverlay = !runtime.loaded() || !hasPicture || signalLost || popupOpen ||
+        const bool showOverlay = !runtime.loaded() || !hasPicture || signalLost || popupOpen || identify.active() ||
                                  io.WantCaptureMouse || (now - lastActivity) < Uint64(kOverlayHideSeconds * 1000);
         const ImVec2 view = io.DisplaySize;
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
+        float barHeight = 0.0f;
 
         if (!runtime.loaded()) {
             ImGui::SetNextWindowPos(ImVec2(view.x * 0.5f, view.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -713,22 +1028,33 @@ int main(int argc, char** argv) {
                 ImGui::SetNextItemWidth(110.0f * uiScale);
                 ImGui::SliderInt("##volume", &settings.volume, 0, 100, "%d%%");
 
-                // Fullscreen
-                sameLineIfFits((displays.size() > 1 ? 330.0f : 200.0f) * uiScale);
-                if (ImGui::Button(isFullscreen() ? "Exit fullscreen" : "Fullscreen")) setFullscreen(!isFullscreen());
-                if (displays.size() > 1) {
+                // Fullscreen + display choice
+                const auto& screens = dm.displays();
+                const int ti = dm.targetIndex();
+                const bool showScreens = screens.size() > 1 || (ti < 0 && !dm.target().name.empty());
+                sameLineIfFits((showScreens ? 470.0f : 200.0f) * uiScale);
+                const char* fsLabel = dm.waitingForTarget() ? "Fullscreen here"
+                                      : dm.wantFullscreen()    ? "Exit fullscreen"
+                                                               : "Fullscreen";
+                if (ImGui::Button(fsLabel)) dm.toggleFullscreen(now);
+                if (showScreens && !screens.empty()) {
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(190.0f * uiScale);
-                    int d = std::clamp(settings.display, 0, int(displays.size()) - 1);
-                    if (ImGui::BeginCombo("##display", displayNames[d].c_str())) {
-                        for (int i = 0; i < int(displays.size()); ++i) {
-                            if (ImGui::Selectable(displayNames[i].c_str(), i == d)) {
-                                settings.display = i;
-                                if (isFullscreen()) setFullscreen(true);
-                            }
+                    ImGui::SetNextItemWidth(230.0f * uiScale);
+                    if (ImGui::BeginCombo("##display", dm.targetLabel().c_str(), ImGuiComboFlags_HeightLarge)) {
+                        for (int i = 0; i < int(screens.size()); ++i)
+                            if (ImGui::Selectable(dm.label(i).c_str(), i == ti)) dm.chooseDisplay(i, false, now);
+                        if (ti < 0 && !dm.target().name.empty()) {
+                            ImGui::Separator();
+                            ImGui::TextDisabled("%s", dm.targetLabel().c_str());
                         }
                         ImGui::EndCombo();
                     }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Identify")) toggleIdentify();
+                }
+                if (dm.waitingForTarget()) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "Waiting for %s", dm.target().name.c_str());
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Settings")) ImGui::OpenPopup("settings");
@@ -749,6 +1075,7 @@ int main(int argc, char** argv) {
                     ImGui::Checkbox("Always show info (I)", &settings.showInfo);
                     ImGui::Separator();
                     ImGui::TextDisabled("Keys: F fullscreen, Esc leave, 1-9 source, 0 none,");
+                    ImGui::TextDisabled("D identify displays, Ctrl+1-9 fullscreen on display N,");
                     ImGui::TextDisabled("M mute, Up/Down volume, I info. Double-click = fullscreen.");
                     ImGui::Separator();
                     ImGui::TextDisabled("FeedView %s", FEEDVIEW_VERSION);
@@ -756,6 +1083,7 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("NDI(R) is a registered trademark of Vizrt NDI AB.");
                     ImGui::EndPopup();
                 }
+                barHeight = ImGui::GetWindowHeight();
                 ImGui::End();
             }
 
@@ -800,6 +1128,18 @@ int main(int argc, char** argv) {
                              IM_COL32(255, 90, 80, 255));
             }
         }
+
+        // ---- Identify card for the screen FeedView fills, and notices
+        if (identify.skipIndex() >= 0 && identify.skipIndex() < int(dm.displays().size())) {
+            const int si = identify.skipIndex();
+            const CardRect card =
+                identifyCardInWindow(view, uiScale, si + 1, dm.displays()[si], si == dm.targetIndex());
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && card.contains(io.MousePos)) {
+                identify.hide();
+                dm.chooseDisplay(si, true, now);
+            }
+        }
+        drawToasts(toasts, now, view, barHeight + 10.0f * uiScale, uiScale);
 
         // Hide the mouse pointer together with the overlay.
         const bool wantCursor = showOverlay || !runtime.loaded();
@@ -850,6 +1190,7 @@ int main(int argc, char** argv) {
 
     if (!(settings == saved) && !settingsPath.empty()) settings.save(settingsPath);
 
+    identify.hide();
     receiver.reset();
     finder.reset();
     audio.close();

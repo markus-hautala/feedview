@@ -46,14 +46,17 @@ bool Settings::load(const std::string& path) {
         else if (key == "volume") volume = toInt(val, volume);
         else if (key == "muted") muted = toInt(val, 0) != 0;
         else if (key == "audio_pair") audioPair = toInt(val, 0);
-        else if (key == "display") display = toInt(val, 0);
+        else if (key == "display") displayIndex = toInt(val, -1);
+        else if (key == "display_name") displayName = val;
+        else if (key == "display_nth") displayNth = toInt(val, 0);
         else if (key == "start_fullscreen") startFullscreen = toInt(val, 0) != 0;
         else if (key == "show_info") showInfo = toInt(val, 0) != 0;
     }
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
     if (audioPair < 0 || audioPair % 2) audioPair = 0;
-    if (display < 0) display = 0;
+    if (displayIndex < -1) displayIndex = -1;
+    if (displayNth < 0) displayNth = 0;
     return true;
 }
 
@@ -65,7 +68,9 @@ bool Settings::save(const std::string& path) const {
         << "volume=" << volume << "\n"
         << "muted=" << (muted ? 1 : 0) << "\n"
         << "audio_pair=" << audioPair << "\n"
-        << "display=" << display << "\n"
+        << "display=" << displayIndex << "\n"
+        << "display_name=" << displayName << "\n"
+        << "display_nth=" << displayNth << "\n"
         << "start_fullscreen=" << (startFullscreen ? 1 : 0) << "\n"
         << "show_info=" << (showInfo ? 1 : 0) << "\n";
     const std::string text = out.str();

@@ -7,6 +7,9 @@ confidence monitors, multiview spares and quick checks of what's on the network.
 - **Video** in its native resolution/frame rate, letterboxed, with alpha shown over black
 - **Audio** with channel-pair selection (Ch 1-2, 3-4, …), volume/mute and clock-drift compensation
 - **Fullscreen** on any display, borderless; controls and pointer hide after 3 s
+- **Live-safe display handling**: survives monitors being unplugged, re-plugged, rearranged or
+  changing resolution without a restart; *Identify* (key **D**) puts a big number on every
+  screen — click one to move FeedView there
 - Clear **signal-lost** state (dimmed last frame + red label) and automatic reconnection
 - Remembers source, volume, channel pair, display and start-in-fullscreen between runs
 - Scriptable: `--source`, `--fullscreen`, `--display`, `--list-sources`, …
@@ -77,6 +80,28 @@ checking colours, motion, channel mapping and A/V without a camera:
 ./build/feedview-test-sender --name Key --alpha --size 1280x720 --fps 59.94
 ```
 
+## Display behaviour during a live event
+
+Displays are numbered left to right. The chosen display is remembered by its name and its
+position among same-named monitors — never by an OS index, which changes whenever something
+is plugged in. When the arrangement changes, FeedView waits ~0.75 s for the burst of OS
+events to settle, then:
+
+| What happens | What FeedView does |
+|---|---|
+| Target screen unplugged / powered off | Leaves fullscreen and waits in a window ("Waiting for …") instead of covering whatever screen the OS moved it to |
+| Target screen comes back (even with a new OS id) | Goes fullscreen on it again and says so |
+| Screens rearranged or resolution changed | Re-fits the fullscreen window |
+| Operator leaves fullscreen via the OS (green button, Win+↓) | Respected — FeedView doesn't fight it |
+| OS kicks it out of fullscreen during a display change | Puts it back |
+| A screen never reports the exact size | Gives up after 3 tries for that arrangement (no flicker loop) |
+| Windowed FeedView left off-screen | Moved back onto a visible screen |
+
+Quick fixes: **D** (Identify, then click a card or press its number), **Ctrl/Cmd+1–9**, the
+display menu, or **F** while waiting = fullscreen right here. The UI rescales when the window
+moves to a monitor with a different scaling factor. On macOS FeedView uses instant
+(non-Spaces) fullscreen so switching never animates or jumps to another Space.
+
 ## How it works
 
 | File | Role |
@@ -84,6 +109,7 @@ checking colours, motion, channel mapping and A/V without a camera:
 | `src/ndi_runtime.*` | Finds and loads the NDI runtime at run time and resolves each function by name, so any NDI 5/6 runtime works (6.1 doesn't export the `NDIlib_v6_load` table newer headers declare) |
 | `src/ndi_io.*` | `SourceFinder` (discovery thread) and `Receiver` (capture thread). Video is requested as BGRA so NDI does the YUV→RGB conversion with the correct BT.601/709 matrix and every renderer can upload it directly |
 | `src/main.cpp` | SDL3 window/renderer/audio, the ImGui overlay, fullscreen, settings and CLI. Audio goes through an SDL audio stream that resamples any source rate; a small controller nudges the playback rate (±0.5 % max) to cancel clock drift between sender and sound card |
+| `src/display_manager.*` | Which screen FeedView is on and how it reacts to display changes. Pure logic with no SDL, covered by `tests/display_manager_test.cpp`, which replays unplug/replug/rearrange/resolution/identical-monitor scenarios against a simulated OS (`ctest`) |
 | `src/settings.*` | `settings.ini` in the per-user app data folder |
 | `tools/test_sender.cpp` | The test-pattern sender |
 

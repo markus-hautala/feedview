@@ -63,6 +63,8 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release --parallel
+      - name: Display-handling tests
+        run: ctest --test-dir build -C Release --output-on-failure
 
       # ---- Package
       - name: Package (Windows)
