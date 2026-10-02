@@ -1,0 +1,4 @@
+build*/
+dist/
+ndi-runtime/
+.DS_Store

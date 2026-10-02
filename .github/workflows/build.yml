@@ -1,0 +1,128 @@
+name: Build
+
+# Builds FeedView for Windows, macOS and Linux, bundles the NDI runtime, smoke-tests the
+# result against a live NDI test source, and attaches the downloads to a GitHub Release
+# when a tag like v1.0.0 is pushed.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create releases on tags
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x64, package: FeedView-windows-x64.zip }
+          - { os: macos-latest, name: macos-universal, package: FeedView-macos-universal.zip }
+          - { os: ubuntu-24.04, name: linux-x86_64, package: FeedView-linux-x86_64.tar.gz }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxss-dev libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev \
+            libgl1-mesa-dev libgles2-mesa-dev libegl1-mesa-dev \
+            libdbus-1-dev libibus-1.0-dev libudev-dev libwayland-dev libdecor-0-dev \
+            libavahi-client3
+
+      # ---- NDI runtime (bundled so end users don't have to install anything)
+      - name: Fetch NDI runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/fetch-ndi-runtime.ps1 -OutDir ndi-runtime
+      - name: Fetch NDI runtime (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: bash scripts/fetch-ndi-runtime.sh ndi-runtime
+
+      # ---- Build
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64
+      - name: Configure (macOS, universal arm64 + x86_64)
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # ---- Package
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = 'FeedView-windows-x64'
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item build/Release/FeedView.exe, build/Release/feedview-test-sender.exe -Destination $stage
+          Copy-Item ndi-runtime/* -Destination $stage
+          Copy-Item packaging/README-dist.txt "$stage/README.txt"
+          Copy-Item THIRD_PARTY_NOTICES.md $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
+          Get-ChildItem dist
+      - name: Package (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: bash scripts/package.sh build ndi-runtime dist
+
+      # ---- Smoke test: the packaged app loads the bundled runtime and finds a live source.
+      # Discovery uses --extra-ips 127.0.0.1 because CI runners have no mDNS.
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = 'dist/FeedView-windows-x64'
+          & "$dir/FeedView.exe" --version | Out-Host
+          $sender = Start-Process -FilePath "$dir/feedview-test-sender.exe" -ArgumentList '--name','CI Test','--seconds','30' -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 3
+          $out = & "$dir/FeedView.exe" --list-sources=6 --extra-ips 127.0.0.1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "FeedView could not load the bundled NDI runtime (exit $LASTEXITCODE)" }
+          Write-Host "Sources: $out"
+          if ($out -notmatch '\(CI Test\)') { Write-Host '::warning::Test source not discovered on this runner' }
+          Stop-Process -Id $sender.Id -ErrorAction SilentlyContinue
+      - name: Smoke test (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            dir=build/FeedView.app/Contents/MacOS
+          else
+            dir=dist/FeedView-linux-x86_64
+          fi
+          "$dir/FeedView" --version
+          "$dir/feedview-test-sender" --name "CI Test" --seconds 30 &
+          sleep 3
+          out="$("$dir/FeedView" --list-sources=6 --extra-ips 127.0.0.1)" || {
+            echo "FeedView could not load the bundled NDI runtime"; exit 1; }
+          echo "Sources: $out"
+          echo "$out" | grep -F "(CI Test)" > /dev/null || echo "::warning::Test source not discovered on this runner"
+          kill %1 2>/dev/null || true
+
+      # Uploaded as-is (no zip-in-zip); the file name becomes the artifact name.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/${{ matrix.package }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/${{ matrix.package }}

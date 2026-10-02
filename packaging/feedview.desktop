@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=FeedView
+Comment=Watch NDI video sources
+Exec=FeedView
+Terminal=false
+Categories=AudioVideo;Video;Player;
