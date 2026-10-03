@@ -2,3 +2,5 @@ build*/
 dist/
 ndi-runtime/
 .DS_Store
+.claude/settings.local.json
+.claude/hooks/

@@ -63,8 +63,10 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release --parallel
-      - name: Tests (display handling, web remote server)
-        run: ctest --test-dir build -C Release --output-on-failure
+      # The "desktop" tests (OS volume/notifications, window stacking, end to end) need a
+      # real desktop session with audio; run them locally with scripts/run-tests.
+      - name: Tests (display handling, web remote server, live-production rules)
+        run: ctest --test-dir build -C Release --output-on-failure -LE desktop
 
       # ---- Package
       - name: Package (Windows)
@@ -127,11 +129,12 @@ jobs:
           for _ in $(seq 1 30); do curl -fs http://127.0.0.1:18080/api/ping && break; sleep 1; done
           echo
           curl -fsS http://127.0.0.1:18080/ | grep "FeedView remote" > /dev/null
-          sleep 2  # settings (with the generated PIN) are written within a second
-          pin=$(grep '^remote_pin=' "$XDG_DATA_HOME/FeedView/FeedView/settings.ini" | cut -d= -f2)
-          curl -fsS -H "X-FeedView-Pin: $pin" http://127.0.0.1:18080/api/state | grep '"displays"' > /dev/null
+          # No PIN by default: state is readable, but commands still need the header
+          curl -fsS http://127.0.0.1:18080/api/ping | grep '"pinRequired":false' > /dev/null
+          curl -fsS http://127.0.0.1:18080/api/state | grep '"displays"' > /dev/null
           code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/api/fullscreen)
-          [ "$code" = 401 ] || { echo "expected 401 without PIN, got $code"; exit 1; }
+          [ "$code" = 403 ] || { echo "expected 403 for a command without X-FeedView-Pin, got $code"; exit 1; }
+          curl -fsS -X POST -H "X-FeedView-Pin: x" -d on=0 http://127.0.0.1:18080/api/controls | grep '"ok":true' > /dev/null
           kill %1
 
       # Uploaded as-is (no zip-in-zip); the file name becomes the artifact name.
@@ -146,3 +149,32 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/${{ matrix.package }}
+
+  # The Bitfocus Companion module: tested (logic, and the packaged module as Companion runs
+  # it, against a stand-in for FeedView's API) and packaged for "Import module package".
+  companion-module:
+    name: companion-module
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: companion/feedview
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - name: Package
+        run: npm run package
+      - name: Tests
+        run: npm test
+      - uses: actions/upload-artifact@v7
+        with:
+          path: companion/feedview/feedview-*.tgz
+          archive: false
+          if-no-files-found: error
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: companion/feedview/feedview-*.tgz

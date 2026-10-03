@@ -14,6 +14,7 @@ std::string remoteStateJson(const RemoteSnapshot& s) {
         .field("version", s.version)
         .field("host", s.host)
         .field("uptime", s.uptimeSeconds)
+        .field("frameGapMs", s.frameGapMs)
         .field("runtimeLoaded", s.runtimeLoaded)
         .field("runtimeVersion", s.runtimeVersion)
         .endObject();
@@ -52,7 +53,13 @@ std::string remoteStateJson(const RemoteSnapshot& s) {
         .field("firstChannel", s.audioPair + 1)
         .field("device", s.haveAudioDevice)
         .field("bufferMs", s.bufferMs)
-        .endObject();
+        .field("system", s.systemVolume)
+        .field("output", s.output);
+    j.key("outputs").beginArray();
+    for (const auto& o : s.outputs)
+        j.beginObject().field("id", o.id).field("name", o.name).field("default", o.isDefault).endObject();
+    j.endArray();
+    j.endObject();
 
     j.key("displays").beginArray();
     for (size_t i = 0; i < s.displays.size(); ++i) {
@@ -83,13 +90,45 @@ std::string remoteStateJson(const RemoteSnapshot& s) {
         .field("x", s.windowX).field("y", s.windowY).field("w", s.windowW).field("h", s.windowH)
         .field("display", s.windowDisplay >= 0 ? s.windowDisplay + 1 : 0)
         .endObject()
+        .field("onTop", s.onTop)
+        .field("picture", s.outputPicture)
+        .key("controls").beginObject()
+        .field("visible", s.controlsVisible)
+        .field("panel", s.panel)
+        .field("cursor", s.cursorVisible)
+        .endObject()
+        .key("fade").beginObject()
+        .field("active", s.fading)
+        .field("waiting", s.fadeWaiting)
+        .field("from", s.fadeFrom)
         .endObject();
+    if (!s.uiRects.empty()) {
+        j.key("ui").beginObject();
+        for (const auto& r : s.uiRects) {
+            j.key(r.name).beginArray();
+            j.value(r.x).value(r.y).value(r.w).value(r.h);
+            j.endArray();
+        }
+        j.endObject();
+    }
+    j.endObject();
 
     j.key("settings").beginObject()
         .field("startFullscreen", s.startFullscreen)
         .field("showInfo", s.showInfo)
         .field("cleanOutput", s.cleanOutput)
+        .field("alwaysOnTop", s.alwaysOnTop)
+        .field("silenceNotifications", s.silenceNotifications)
+        .field("fadeMs", s.fadeMs)
         .field("extraIps", s.extraIps)
+        .endObject();
+
+    j.key("notifications").beginObject()
+        .field("supported", s.notificationsSupported)
+        .field("permitted", s.notificationsPermitted)
+        .field("silenced", s.notificationsSilenced)
+        .field("permissionPending", s.notificationsPermissionPending)
+        .field("message", s.notificationsMessage)
         .endObject();
 
     j.key("remote").beginObject().field("pinRequired", s.pinRequired);
@@ -108,6 +147,12 @@ std::string remoteStateJson(const RemoteSnapshot& s) {
 
     j.endObject();
     return j.str();
+}
+
+std::string remoteLink(const std::string& baseUrl, bool pinRequired, const std::string& pin) {
+    std::string url = baseUrl;
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    return url + (pinRequired && !pin.empty() ? "/#pin=" + pin : "/");
 }
 
 std::vector<uint8_t> makePreview(const VideoFrame& f, int maxWidth, int& outW, int& outH) {

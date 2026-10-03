@@ -1,22 +1,42 @@
 FeedView - a simple player for NDI(R) video sources
 ====================================================
 
-Start FeedView, move the mouse to show the controls, and pick a source from the
-Source menu. Everything you change (source, volume, audio channels, display) is
-remembered for next time.
+Start FeedView, move the mouse for a second to show the controls, and pick a source
+from the Source menu. Until then the window is black: that's "None", the safe black
+output. Everything you change (source, audio channels, display) is remembered for
+next time.
 
 Keys
   F or F11      fullscreen on / off (double-click the picture does the same)
   Esc           leave fullscreen
-  1-9           switch to source 1-9 in the list, 0 = no source
+  1-9           switch to source 1-9 in the list, 0 = None (black)
   D             show display numbers on every screen; click one, or press its
                 number, to put FeedView fullscreen there (Esc cancels)
   Ctrl+1-9      fullscreen on display 1-9 directly (Cmd+1-9 on a Mac)
   M             mute
   Up / Down     volume
   I             always show the info line
+  R             web remote address and QR code (Enter opens it in the browser)
 
 Screens are numbered from left to right, as arranged in the OS display settings.
+
+Live production
+  - The pointer and controls appear only after the mouse has moved for a second, so a
+    bumped mouse shows nothing on the output, and hide 2 s after the mouse stops.
+    Open menus close after 15 s.
+  - None (top of every source list, key 0) is a plain black output with no text: the
+    safe choice when no source is available.
+  - Sources change with a fade: the old picture stays until the new source is up, then
+    dissolves into it, so the output never flashes black. Settings -> Fade between
+    sources (0.5 s by default, 0 = cut).
+  - Always on top (Settings, on): nothing covers FeedView; fullscreen from the web
+    remote comes to the front even from behind other windows or minimized, without
+    taking the keyboard from whoever is using the computer.
+  - Silence notifications (Settings, on, Windows): OS notifications are off while
+    FeedView runs. The first time, click Allow... and confirm the Windows prompt
+    (needs an administrator, once).
+  - Windows: the volume and mute are the computer's own, and Settings or the web
+    remote choose the sound output.
 
 When screens change during an event
   Nothing needs restarting. FeedView remembers its screen by name, not by number:
@@ -32,14 +52,22 @@ When screens change during an event
     it and goes fullscreen as soon as it appears.
 
 Web remote (control FeedView from a phone or another computer)
-  Click Remote in FeedView's toolbar. Scan the QR code with a phone on the same
-  network, or type the address shown there (e.g. http://192.168.1.20:8080) and the PIN.
+  Click Remote in FeedView's toolbar (or press R). Scan the QR code with a phone on
+  the same network, type the address shown there (e.g. http://192.168.1.20:8080), or
+  click it to open it in this computer's browser.
   The page shows your screens as arranged, with FeedView's live picture drawn on the
-  screen it's on. Tap a screen or a source, then press Take. Volume and mute act
-  right away. "Show display numbers" puts big numbers on every screen.
+  screen it's on. Tap a screen or a source, then press Take (or Cut: no fade). Volume,
+  mute and the sound output act right away. "Show display numbers" puts big numbers on every
+  screen. If FeedView's controls or a panel are on its screen, "Hide" removes them.
   Settings -> Clean output keeps all FeedView text off the projected picture; status
   and events are then only in the web remote.
-  Turn it off in the Remote panel. Anyone with the PIN on your network can use it.
+  No PIN is needed by default: anyone on your network can use it. Tick Require PIN in
+  the Remote panel to need one, or turn the remote off there.
+
+Bitfocus Companion (Stream Deck and other control surfaces)
+  The FeedView module (feedview-<version>.tgz, with the releases) has the same controls
+  as the web remote. Import it on Companion's Modules page, add a FeedView connection
+  and enter the address from FeedView's Remote panel.
 
 First start
   Windows  If SmartScreen says "Windows protected your PC", click More info -> Run anyway

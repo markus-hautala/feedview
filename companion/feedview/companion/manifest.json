@@ -1,0 +1,26 @@
+{
+	"$schema": "../node_modules/@companion-module/base/assets/manifest.schema.json",
+	"id": "feedview",
+	"name": "FeedView",
+	"shortname": "feedview",
+	"description": "Control FeedView (NDI player for confidence monitors and projection): sources with fades, None (black), screens, fullscreen, system volume and sound output, settings",
+	"version": "0.0.0",
+	"license": "MIT",
+	"repository": "",
+	"bugs": "",
+	"maintainers": [
+		{
+			"name": "Markus Hautala"
+		}
+	],
+	"runtime": {
+		"type": "node22",
+		"api": "nodejs-ipc",
+		"apiVersion": "0.0.0",
+		"entrypoint": "../src/main.js"
+	},
+	"legacyIds": [],
+	"manufacturer": "FeedView",
+	"products": ["FeedView NDI player"],
+	"keywords": ["NDI", "player", "monitor", "projector", "fullscreen"]
+}

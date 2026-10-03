@@ -26,13 +26,9 @@ int toInt(const std::string& v, int fallback) {
 
 }  // namespace
 
-bool Settings::load(const std::string& path) {
-    size_t size = 0;
-    void* data = SDL_LoadFile(path.c_str(), &size);
-    if (!data) return false;
-    std::istringstream in(std::string(static_cast<const char*>(data), size));
-    SDL_free(data);
-
+bool Settings::parse(const std::string& text) {
+    std::istringstream in(text);
+    int version = 1;  // files from FeedView 1.0 have no version line
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
@@ -41,7 +37,8 @@ bool Settings::load(const std::string& path) {
         std::string key = trim(line.substr(0, eq));
         std::string val = line.substr(eq + 1);
         if (!val.empty() && val.back() == '\r') val.pop_back();
-        if (key == "source") source = val;
+        if (key == "settings_version") version = toInt(val, 1);
+        else if (key == "source") source = val;
         else if (key == "extra_ips") extraIps = trim(val);
         else if (key == "volume") volume = toInt(val, volume);
         else if (key == "muted") muted = toInt(val, 0) != 0;
@@ -52,14 +49,23 @@ bool Settings::load(const std::string& path) {
         else if (key == "start_fullscreen") startFullscreen = toInt(val, 0) != 0;
         else if (key == "show_info") showInfo = toInt(val, 0) != 0;
         else if (key == "clean_output") cleanOutput = toInt(val, 0) != 0;
+        else if (key == "fade_ms") fadeMs = toInt(val, fadeMs);
+        else if (key == "always_on_top") alwaysOnTop = toInt(val, 1) != 0;
+        else if (key == "silence_notifications") silenceNotifications = toInt(val, 1) != 0;
+        else if (key == "silenced_notifications") silencedNotifications = toInt(val, 0) != 0;
         else if (key == "remote_enabled") remoteEnabled = toInt(val, 1) != 0;
         else if (key == "remote_port") remotePort = toInt(val, 8080);
         else if (key == "remote_pin") remotePin = trim(val);
-        else if (key == "remote_require_pin") remoteRequirePin = toInt(val, 1) != 0;
+        else if (key == "remote_require_pin") remoteRequirePin = toInt(val, 0) != 0;
     }
+    // 1.0 saved the PIN requirement even though nobody could have chosen it (it was the
+    // default); the default is now off.
+    if (version < 2) remoteRequirePin = false;
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
     if (audioPair < 0 || audioPair % 2) audioPair = 0;
+    if (fadeMs < 0) fadeMs = 0;
+    if (fadeMs > 10000) fadeMs = 10000;
     if (displayIndex < -1) displayIndex = -1;
     if (displayNth < 0) displayNth = 0;
     if (remotePort < 1 || remotePort > 65535) remotePort = 8080;
@@ -68,9 +74,10 @@ bool Settings::load(const std::string& path) {
     return true;
 }
 
-bool Settings::save(const std::string& path) const {
+std::string Settings::serialize() const {
     std::ostringstream out;
     out << "# FeedView settings\n"
+        << "settings_version=" << kVersion << "\n"
         << "source=" << source << "\n"
         << "extra_ips=" << extraIps << "\n"
         << "volume=" << volume << "\n"
@@ -82,12 +89,28 @@ bool Settings::save(const std::string& path) const {
         << "start_fullscreen=" << (startFullscreen ? 1 : 0) << "\n"
         << "show_info=" << (showInfo ? 1 : 0) << "\n"
         << "clean_output=" << (cleanOutput ? 1 : 0) << "\n"
+        << "fade_ms=" << fadeMs << "\n"
+        << "always_on_top=" << (alwaysOnTop ? 1 : 0) << "\n"
+        << "silence_notifications=" << (silenceNotifications ? 1 : 0) << "\n"
+        << "silenced_notifications=" << (silencedNotifications ? 1 : 0) << "\n"
         << "remote_enabled=" << (remoteEnabled ? 1 : 0) << "\n"
         << "remote_port=" << remotePort << "\n"
         << "remote_pin=" << remotePin << "\n"
         << "remote_require_pin=" << (remoteRequirePin ? 1 : 0) << "\n";
-    const std::string text = out.str();
+    return out.str();
+}
 
+bool Settings::load(const std::string& path) {
+    size_t size = 0;
+    void* data = SDL_LoadFile(path.c_str(), &size);
+    if (!data) return false;
+    std::string text(static_cast<const char*>(data), size);
+    SDL_free(data);
+    return parse(text);
+}
+
+bool Settings::save(const std::string& path) const {
+    const std::string text = serialize();
     // Write a temp file first so a crash never leaves a half-written settings file.
     const std::string tmp = path + ".tmp";
     if (!SDL_SaveFile(tmp.c_str(), text.data(), text.size())) return false;

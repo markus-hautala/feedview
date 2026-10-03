@@ -14,10 +14,13 @@
 #include "ndi_io.h"
 #include "ndi_runtime.h"
 #include "net_info.h"
+#include "os_control.h"
+#include "overlay_activity.h"
 #include "qrcodegen.hpp"
 #include "remote_server.h"
 #include "remote_view.h"
 #include "settings.h"
+#include "take_fade.h"
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +30,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -54,7 +58,6 @@ constexpr const char* kAppName = "FeedView";
 #ifndef FEEDVIEW_IDENTIFY_MIN_DISPLAYS
 #define FEEDVIEW_IDENTIFY_MIN_DISPLAYS 2  // tests on a single-screen machine build with 1
 #endif
-constexpr double kOverlayHideSeconds = 3.0;
 
 // ---------------------------------------------------------------------------------------
 // Command line
@@ -74,6 +77,8 @@ struct Options {
     bool version = false;
     int remotePort = -1;
     bool noRemote = false;
+    std::string settingsFile;
+    std::string grantSid;  // internal: the elevated helper of the notification permission
     std::string error;
 };
 
@@ -89,12 +94,14 @@ const char* kUsage =
     "  --list-sources[=S]  Print the sources found within S seconds (default 3) and exit\n"
     "  --remote-port N     Port for the web remote (default 8080, next free one if taken)\n"
     "  --no-remote         Turn the web remote off for this run\n"
+    "  --settings FILE     Use this settings file instead of the per-user one\n"
     "  --version           Print version and exit\n"
     "  --help              Show this help\n"
     "\n"
-    "Keys: F/F11 fullscreen, Esc leave fullscreen, 1-9 pick source, 0 disconnect,\n"
+    "Keys: F/F11 fullscreen, Esc leave fullscreen, 1-9 pick source, 0 None (black),\n"
     "      D show display numbers (then click one or press its number),\n"
-    "      Ctrl+1-9 fullscreen on display N, M mute, Up/Down volume, I info overlay.\n";
+    "      Ctrl+1-9 fullscreen on display N, M mute, Up/Down volume, I info overlay,\n"
+    "      R web remote address (Enter opens it in the browser).\n";
 
 Options parseArgs(int argc, char** argv) {
     Options o;
@@ -129,6 +136,10 @@ Options parseArgs(int argc, char** argv) {
             o.volume = std::clamp(std::atoi(v.c_str()), 0, 100);
         } else if (value(i, a, "--remote-port", v)) {
             o.remotePort = std::clamp(std::atoi(v.c_str()), 1, 65535);
+        } else if (value(i, a, "--settings", v)) {
+            o.settingsFile = v;
+        } else if (value(i, a, "--grant-notification-control", v)) {
+            o.grantSid = v;
         } else if (a == "--no-remote") {
             o.noRemote = true;
         } else if (a == "--fullscreen" || a == "-f") {
@@ -346,8 +357,11 @@ void applyUiStyle(float scale) {
 
 class SdlDisplayPlatform : public DisplayPlatform {
 public:
-    SdlDisplayPlatform(SDL_Window* w, std::function<void(const std::string&)> notify)
-        : w_(w), notify_(std::move(notify)) {}
+    // `raise` brings the window above other windows (without taking keyboard focus) after
+    // it was put somewhere: fullscreen or a move must be visible even if FeedView was
+    // minimized or behind the active window, e.g. when the web remote asks for it.
+    SdlDisplayPlatform(SDL_Window* w, std::function<void(const std::string&)> notify, std::function<void()> raise)
+        : w_(w), notify_(std::move(notify)), raise_(std::move(raise)) {}
 
     std::vector<DisplayInfo> displays() override {
         std::vector<DisplayInfo> out;
@@ -376,6 +390,7 @@ public:
         return {x, y, ww, hh};
     }
     void enterFullscreen(uint32_t id) override {
+        unminimize();
         // Leave first, so a changed resolution/arrangement is picked up cleanly.
         if (windowFullscreen()) {
             SDL_SetWindowFullscreen(w_, false);
@@ -386,12 +401,14 @@ public:
         SDL_SetWindowFullscreenMode(w_, nullptr);  // borderless "desktop" fullscreen
         SDL_SetWindowFullscreen(w_, true);
         SDL_SyncWindow(w_);
+        raise_();
     }
     void leaveFullscreen() override {
         SDL_SetWindowFullscreen(w_, false);
         SDL_SyncWindow(w_);
     }
     void moveWindowTo(uint32_t id) override {
+        unminimize();
         if (windowFullscreen()) leaveFullscreen();
         SDL_Rect b{};
         int ww = 0, hh = 0;
@@ -403,12 +420,24 @@ public:
         }
         SDL_SetWindowPosition(w_, SDL_WINDOWPOS_CENTERED_DISPLAY(id), SDL_WINDOWPOS_CENTERED_DISPLAY(id));
         SDL_SyncWindow(w_);
+        raise_();
     }
     void notify(const std::string& m) override { notify_(m); }
 
 private:
+    void unminimize() {
+        if (!(SDL_GetWindowFlags(w_) & SDL_WINDOW_MINIMIZED)) return;
+#if defined(_WIN32)
+        raise_();  // restores without activating; SDL_RestoreWindow would take the keyboard
+#else
+        SDL_RestoreWindow(w_);
+#endif
+        SDL_SyncWindow(w_);
+    }
+
     SDL_Window* w_;
     std::function<void(const std::string&)> notify_;
+    std::function<void()> raise_;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -606,6 +635,15 @@ std::optional<bool> parseSwitch(const RemoteCommand& c, const char* key, bool cu
     return std::nullopt;
 }
 
+// "0".."10000" (milliseconds) -> out.
+bool parseFadeMs(const std::string& v, int& out) {
+    if (v.empty() || v.size() > 5 || v.find_first_not_of("0123456789") != std::string::npos) return false;
+    const int n = std::atoi(v.c_str());
+    if (n > TakeFade::kMaxFadeMs) return false;
+    out = n;
+    return true;
+}
+
 int64_t unixMillis() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -639,6 +677,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n\n%s", opt.error.c_str(), kUsage);
         return 1;
     }
+    if (!opt.grantSid.empty()) return os::grantNotificationControl(opt.grantSid) ? 0 : 3;  // elevated helper
     if (opt.help) {
         std::printf("%s", kUsage);
         return 0;
@@ -654,12 +693,16 @@ int main(int argc, char** argv) {
     // a click on an inactive window acts immediately - both matter during a live event.
     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    // The output stays up while the operator works in other windows (or the browser).
+    SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
     // ---- Settings
-    std::string settingsPath;
-    if (char* pref = SDL_GetPrefPath("FeedView", "FeedView")) {
-        settingsPath = std::string(pref) + "settings.ini";
-        SDL_free(pref);
+    std::string settingsPath = opt.settingsFile;
+    if (settingsPath.empty()) {
+        if (char* pref = SDL_GetPrefPath("FeedView", "FeedView")) {
+            settingsPath = std::string(pref) + "settings.ini";
+            SDL_free(pref);
+        }
     }
     Settings settings;
     if (!settingsPath.empty()) settings.load(settingsPath);
@@ -689,12 +732,17 @@ int main(int argc, char** argv) {
     }
 
     float uiScale = contentScaleFor(nullptr);
-    SDL_Window* window = SDL_CreateWindow(kAppName, int(960 * uiScale), int(540 * uiScale),
-                                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_Window* window = SDL_CreateWindow(
+        kAppName, int(960 * uiScale), int(540 * uiScale),
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
+            (settings.alwaysOnTop ? SDL_WINDOW_ALWAYS_ON_TOP : SDL_WindowFlags(0)));
     if (!window) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kAppName, SDL_GetError(), nullptr);
         return 1;
     }
+    // Windows: the HWND, for stacking above other windows (os_control.h). Null elsewhere.
+    void* const nativeWindow =
+        SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
     SDL_SetWindowMinimumSize(window, 320, 180);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, nullptr);
     if (!renderer) {
@@ -720,44 +768,144 @@ int main(int argc, char** argv) {
     ImGui_ImplSDLRenderer3_Init(renderer);
 
     // ---- Audio + NDI
-    AudioOut audio;
-    if (haveAudio) haveAudio = audio.open();
-    audio.setGain(volumeToGain(settings.volume, settings.muted));
+    // Volume and mute are the computer's own (the OS volume of the default output, which
+    // FeedView plays to) wherever FeedView can control them, so the remote controls what
+    // the room hears. Elsewhere FeedView's own volume is used.
+    os::SystemAudio systemAudio;
+    auto volumeNow = [&] { return systemAudio.available() ? std::max(0, systemAudio.volume()) : settings.volume; };
+    auto mutedNow = [&] { return systemAudio.available() ? systemAudio.muted() : settings.muted; };
+    auto setVolume = [&](int v) {
+        v = std::clamp(v, 0, 100);
+        if (!systemAudio.available() || !systemAudio.setVolume(v)) settings.volume = v;
+    };
+    auto setMuted = [&](bool m) {
+        if (!systemAudio.available() || !systemAudio.setMuted(m)) settings.muted = m;
+    };
+    auto appGain = [&] { return systemAudio.available() ? 1.0f : volumeToGain(settings.volume, settings.muted); };
+    if (systemAudio.available()) {  // command-line choices go to the OS volume
+        if (opt.volume >= 0) systemAudio.setVolume(opt.volume);
+        if (opt.mute) systemAudio.setMuted(true);
+    }
+    // Two sound streams, so the old and the new source can crossfade during a take; SDL
+    // mixes them. `audio` plays the current source, `fadeAudio` the one fading out.
+    AudioOut audioA, audioB;
+    if (haveAudio) haveAudio = audioA.open();
+    if (haveAudio) audioB.open();
+    AudioOut* audio = &audioA;
+    AudioOut* fadeAudio = &audioB;
+    audio->setGain(appGain());
 
     std::unique_ptr<SourceFinder> finder;
-    std::unique_ptr<Receiver> receiver;
+    std::unique_ptr<Receiver> receiver;  // the current (chosen) source
+    auto makeReceiver = [&](AudioOut* sink) {
+        auto r = std::make_unique<Receiver>(
+            runtime.api(), [sink](const float* s, int frames, int rate) { sink->push(s, frames, rate); });
+        r->setAudioPair(settings.audioPair);
+        return r;
+    };
     auto startNdi = [&]() {
         finder = std::make_unique<SourceFinder>(runtime.api());
         finder->start(settings.extraIps);
-        receiver = std::make_unique<Receiver>(runtime.api(), [&audio](const float* s, int frames, int rate) {
-            audio.push(s, frames, rate);
-        });
-        receiver->setAudioPair(settings.audioPair);
+        receiver = makeReceiver(audio);
     };
     if (runtime.loaded()) startNdi();
 
-    VideoFrame frame;  // frame currently shown
+    VideoFrame frame;  // the current source's latest frame
     SDL_Texture* texture = nullptr;
     int texW = 0, texH = 0;
+    bool texAlpha = false;
+    bool firstFrameSeen = false;  // since the current source was taken
+    // Uploads a frame into a texture of the right size. Frames without alpha go into an
+    // X format so the padding byte can't act as transparency when fading.
+    auto upload = [&](const VideoFrame& f, SDL_Texture*& tex, int& w, int& h, bool& alpha) {
+        if (!tex || w != f.width || h != f.height || alpha != f.hasAlpha) {
+            if (tex) SDL_DestroyTexture(tex);
+            tex = SDL_CreateTexture(renderer, f.hasAlpha ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_BGRX32,
+                                    SDL_TEXTUREACCESS_STREAMING, f.width, f.height);
+            w = f.width;
+            h = f.height;
+            alpha = f.hasAlpha;
+            if (tex) SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_LINEAR);
+        }
+        if (tex) SDL_UpdateTexture(tex, nullptr, f.pixels.data(), f.width * 4);
+    };
+
+    // ---- Fades between sources (see take_fade.h). The old source keeps running here,
+    // with its own picture and sound stream, until it has faded out.
+    TakeFade fade;
+    TakeFade::Mix mix;  // this frame's
+    struct Outgoing {
+        std::unique_ptr<Receiver> rx;
+        VideoFrame frame;
+        SDL_Texture* tex = nullptr;
+        int texW = 0, texH = 0;
+        bool texAlpha = false;
+        bool hasPicture() const { return rx && tex && frame.serial != 0; }
+    } outgoing;
+    // Receivers are shut down in the background (joining the capture thread can take a
+    // frame or two); their sound stream is reused only after that has finished.
+    std::future<void> retiring;
+    auto retire = [&](std::unique_ptr<Receiver> r) {
+        if (retiring.valid()) retiring.wait();
+        if (r) retiring = std::async(std::launch::async, [r = std::move(r)]() mutable { r.reset(); });
+    };
+    auto dropOutgoing = [&]() {
+        retire(std::move(outgoing.rx));
+        outgoing.frame = VideoFrame{};
+    };
 
     std::vector<NdiSource> sources;
     Uint64 lastConnect = 0;
+    uint64_t lastPreviewKey = ~uint64_t(0);  // forces a new preview after a take
     auto urlFor = [&](const std::string& name) -> std::string {
         for (const auto& s : sources)
             if (s.name == name) return s.url;
         return std::string();
     };
-    auto selectSource = [&](const std::string& name) {
+    // Takes a source ("" = None, black). With a picture on screen the old source keeps
+    // playing until the new one is up, then they dissolve over fadeMs (0 = cut at that
+    // moment, so even a cut never flashes black while connecting). From black the new
+    // picture fades in when it arrives.
+    auto selectSource = [&](const std::string& name, int fadeMs) {
         if (!receiver) return;
-        receiver->connect(name, urlFor(name));  // stops the old capture thread first
-        audio.flush();
-        lastConnect = SDL_GetTicks();
+        const Uint64 now = SDL_GetTicks();
+        const bool currentShown = texture && frame.serial != 0;
+        if (currentShown || outgoing.hasPicture()) {
+            if (fade.active() && outgoing.hasPicture() && (!currentShown || mix.outgoing > mix.incoming)) {
+                // Taken again mid-fade and the old picture is still the main one: it stays the
+                // one fading out, the half-faded new source is replaced.
+                receiver->connect(name, urlFor(name));
+                audio->flush();
+            } else {
+                dropOutgoing();
+                outgoing.rx = std::move(receiver);
+                outgoing.frame = std::move(frame);
+                std::swap(outgoing.tex, texture);
+                std::swap(outgoing.texW, texW);
+                std::swap(outgoing.texH, texH);
+                std::swap(outgoing.texAlpha, texAlpha);
+                std::swap(audio, fadeAudio);
+                if (retiring.valid()) retiring.wait();  // nothing may still push into this stream
+                audio->flush();
+                receiver = makeReceiver(audio);
+                receiver->connect(name, urlFor(name));
+            }
+            fade.begin(now, Uint64(fadeMs), !name.empty());
+        } else {
+            dropOutgoing();
+            receiver->connect(name, urlFor(name));  // stops the old capture thread first
+            audio->flush();
+            fade.fadeInNext(Uint64(std::max(0, fadeMs)));
+        }
         frame = VideoFrame{};
+        firstFrameSeen = false;
+        lastPreviewKey = ~uint64_t(0);
+        lastConnect = now;
         settings.source = name;
         std::string title = name.empty() ? std::string(kAppName) : name + " - " + kAppName;
         SDL_SetWindowTitle(window, title.c_str());
     };
-    if (receiver && !settings.source.empty()) selectSource(settings.source);
+    if (receiver && !settings.source.empty()) selectSource(settings.source, settings.fadeMs);
 
     // ---- Displays / fullscreen (see display_manager.h for the behaviour)
     std::vector<Toast> toasts;
@@ -777,11 +925,48 @@ int main(int argc, char** argv) {
             if (toasts.size() > 3) toasts.erase(toasts.begin());
         }
     };
-    SdlDisplayPlatform platform(window, notify);
+    // ---- Staying on top (live production: nothing may cover the output)
+    // The operator opening the remote in this computer's browser from FeedView's own link
+    // suspends it, or the browser would open hidden behind FeedView. Any fullscreen/display
+    // command, or clicking FeedView, resumes it.
+    bool onTopSuspended = false;
+    auto wantOnTop = [&] { return settings.alwaysOnTop && !onTopSuspended; };
+    auto applyOnTop = [&] { SDL_SetWindowAlwaysOnTop(window, wantOnTop()); };
+    auto raise = [&] {
+        onTopSuspended = false;
+        applyOnTop();
+        os::raiseWindow(nativeWindow, wantOnTop());
+    };
+    Uint64 lastOnTopCheck = 0;
+
+    SdlDisplayPlatform platform(window, notify, raise);
     DisplayManager dm(platform);
     dm.setTarget({settings.displayName, settings.displayNth, settings.displayIndex});
     if (opt.display >= 0) dm.setTarget({std::string(), 0, opt.display});  // --display N
     IdentifyOverlay identify;
+    OverlayActivity activity;  // when FeedView's own controls are on screen
+
+    // ---- OS notifications are off while FeedView runs (and back as they were afterwards)
+    os::NotificationSilencer silencer;
+    auto applyNotificationSetting = [&]() {
+        if (!silencer.supported()) return;
+        if (settings.silenceNotifications) {
+            if (silencer.isSilenced()) return;  // already off: by us earlier, or by an administrator
+            if (silencer.silence(true)) settings.silencedNotifications = true;
+        } else if (settings.silencedNotifications) {
+            if (silencer.silence(false)) settings.silencedNotifications = false;
+        }
+    };
+    auto notificationStatus = [&]() -> std::string {
+        if (!silencer.supported()) return "Not available on this operating system";
+        if (silencer.permissionPending()) return "Waiting for the Windows permission prompt on the FeedView computer";
+        if (!settings.silenceNotifications) return "Notifications are on";
+        if (silencer.isSilenced()) return "Notifications are off while FeedView runs";
+        if (!silencer.permitted()) return "Needs a one-time permission from an administrator";
+        return silencer.lastError().empty() ? "Switching notifications off" : silencer.lastError();
+    };
+    applyNotificationSetting();
+    bool permissionWasPending = false;
 
     auto toggleIdentify = [&]() {
         if (identify.active()) {
@@ -817,7 +1002,7 @@ int main(int argc, char** argv) {
     remote.setFont(kUiFontData, kUiFontDataSize);
     remote.setIdentity(hostName, FEEDVIEW_VERSION);
     remote.setActions({"fullscreen", "display", "identify", "source", "reconnect", "volume", "mute", "audio-pair",
-                       "settings"});
+                       "audio-output", "controls", "settings", "allow-notification-control"});
     std::string remoteError;
     std::vector<std::string> localAddresses = localIPv4Addresses();
     Uint64 lastAddressRefresh = SDL_GetTicks();
@@ -847,9 +1032,46 @@ int main(int argc, char** argv) {
         urls.push_back("http://" + hostName + ".local" + port);
         return urls;
     };
+    // The links in FeedView open the remote page in this computer's browser, signed in.
+    auto openRemoteLink = [&](const std::string& base) {
+        const std::string url = remoteLink(base, settings.remoteRequirePin, settings.remotePin);
+        if (const char* log = SDL_getenv("FEEDVIEW_TEST_OPEN_URL_LOG")) {  // tests: record instead of opening
+            if (SDL_IOStream* f = SDL_IOFromFile(log, "ab")) {
+                const std::string line = url + "\n";
+                SDL_WriteIO(f, line.data(), line.size());
+                SDL_CloseIO(f);
+            }
+        } else if (!SDL_OpenURL(url.c_str())) {
+            notify(std::string("Couldn't open the browser: ") + SDL_GetError());
+            return;
+        }
+        // The browser opens on the main screen (usually): don't stay above it there.
+        const bool fullscreenNow = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+        if (settings.alwaysOnTop && (!fullscreenNow || SDL_GetDisplayForWindow(window) == SDL_GetPrimaryDisplay())) {
+            onTopSuspended = true;
+            applyOnTop();
+        }
+        notify("Opened the web remote in this computer's browser");
+    };
     // Latest values from the frame loop, for the web remote (also valid while minimized).
     ReceiverStatus lastStatus;
     bool lastHasPicture = false, lastSignalLost = false;
+    bool lastOutputPicture = false;       // something is on the output (also a source fading out)
+    bool lastPreviewFromOutgoing = false;  // the fading-out picture is the main one on the output
+    bool lastOverlayShown = false;  // FeedView's controls were drawn in the last frame
+    bool lastCursorShown = false;
+    std::string lastPanel;          // and which menu/panel was open
+    // Tests (FEEDVIEW_TEST_UI set): where some controls are, in window pixels, so a test can
+    // click them like a person would. Published in the state as output.ui.
+    const bool testUi = SDL_getenv("FEEDVIEW_TEST_UI") != nullptr;
+    std::vector<RemoteUiRect> uiRectsNow, lastUiRects;
+    auto markUi = [&](const char* name) {
+        if (!testUi) return;
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        const ImVec2 s = ImGui::GetIO().DisplayFramebufferScale;
+        uiRectsNow.push_back({name, int(a.x * s.x), int(a.y * s.y), int((b.x - a.x) * s.x), int((b.y - a.y) * s.y)});
+    };
+    Uint64 frameGap = 0, frameGapAt = 0, lastLoopTicks = 0;  // longest frame interval, last ~5 s
 
     auto remoteState = [&]() {
         RemoteSnapshot r;
@@ -858,6 +1080,7 @@ int main(int argc, char** argv) {
         r.runtimeLoaded = runtime.loaded();
         r.runtimeVersion = runtime.versionString();
         r.uptimeSeconds = double(SDL_GetTicks() - startTicks) / 1000.0;
+        r.frameGapMs = int(frameGap);
         r.source = receiver ? receiver->source() : settings.source;
         for (const auto& src : sources) {
             r.sources.push_back(src.name);
@@ -867,11 +1090,14 @@ int main(int argc, char** argv) {
         r.hasPicture = lastHasPicture;
         r.signalLost = lastSignalLost;
         r.frameSerial = frame.serial;
-        r.volume = settings.volume;
-        r.muted = settings.muted;
+        r.volume = volumeNow();
+        r.muted = mutedNow();
         r.audioPair = settings.audioPair;
         r.haveAudioDevice = haveAudio;
-        r.bufferMs = audio.bufferMs();
+        r.bufferMs = audio->bufferMs();
+        r.systemVolume = systemAudio.available();
+        for (const auto& o : systemAudio.outputs()) r.outputs.push_back({o.id, o.name, o.isDefault});
+        r.output = systemAudio.defaultOutput();
         const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
         for (const auto& d : dm.displays()) {
             RemoteDisplay rd;
@@ -897,10 +1123,27 @@ int main(int argc, char** argv) {
         const SDL_DisplayID wd = SDL_GetDisplayForWindow(window);
         for (int i = 0; i < int(dm.displays().size()); ++i)
             if (dm.displays()[i].id == wd) r.windowDisplay = i;
+        r.onTop = nativeWindow ? os::isTopmost(nativeWindow) : wantOnTop();
+        r.controlsVisible = lastOverlayShown;
+        r.cursorVisible = lastCursorShown;
+        r.panel = lastPanel;
+        r.uiRects = lastUiRects;
+        r.outputPicture = lastOutputPicture;
+        r.fading = fade.active();
+        r.fadeWaiting = fade.active() && mix.waiting;
+        if (fade.active() && outgoing.rx) r.fadeFrom = outgoing.rx->source();
         r.startFullscreen = settings.startFullscreen;
         r.showInfo = settings.showInfo;
         r.cleanOutput = settings.cleanOutput;
+        r.fadeMs = settings.fadeMs;
+        r.alwaysOnTop = settings.alwaysOnTop;
+        r.silenceNotifications = settings.silenceNotifications;
         r.extraIps = settings.extraIps;
+        r.notificationsSupported = silencer.supported();
+        r.notificationsPermitted = silencer.permitted();
+        r.notificationsSilenced = silencer.isSilenced();
+        r.notificationsPermissionPending = silencer.permissionPending();
+        r.notificationsMessage = notificationStatus();
         r.pinRequired = settings.remoteRequirePin;
         r.urls = remoteUrls();
         r.clients = remote.recentClients(15);
@@ -918,7 +1161,13 @@ int main(int argc, char** argv) {
         if (a == "fullscreen") {
             auto on = parseSwitch(c, "on", dm.wantFullscreen() && !dm.waitingForTarget());
             if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
-            dm.setFullscreen(*on, t);
+            const bool alreadyFullscreen = dm.wantFullscreen() && !dm.waitingForTarget() &&
+                                           (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+            if (*on && alreadyFullscreen)
+                raise();  // only bring it back on top (e.g. from behind the browser), no flicker
+            else
+                dm.setFullscreen(*on, t);
+            if (*on) activity.dismiss();  // a clean output: no menus or panels left over it
             return {true, *on ? "Fullscreen on " + dm.targetLabel() : "Fullscreen off"};
         }
         if (a == "display") {
@@ -929,7 +1178,19 @@ int main(int argc, char** argv) {
             const bool fs = parseSwitch(c, "fullscreen", true).value_or(true);
             identify.hide();
             dm.chooseDisplay(n - 1, fs, t);
+            if (fs) activity.dismiss();
             return {true, (fs ? "Fullscreen on " : "Moved to ") + dm.label(n - 1)};
+        }
+        if (a == "controls") {
+            // FeedView's own controls on its screen: off hides them and closes any panel
+            // (e.g. the Remote panel with the QR code) until someone uses them at the computer.
+            const auto on = c.has("on") ? parseSwitch(c, "on", activity.active()) : std::optional<bool>(false);
+            if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
+            if (*on)
+                activity.show(t);
+            else
+                activity.dismiss();
+            return {true, *on ? "FeedView's controls are showing" : "FeedView's controls hidden"};
         }
         if (a == "identify") {
             auto on = parseSwitch(c, "on", identify.active());
@@ -940,17 +1201,21 @@ int main(int argc, char** argv) {
             toggleIdentify();
             return {true, *on ? "Showing display numbers on all screens" : "Display numbers hidden"};
         }
+        // fade_ms=N overrides the fade for one take (0 = cut).
+        int fadeMs = settings.fadeMs;
+        if (c.has("fade_ms") && !parseFadeMs(c.param("fade_ms"), fadeMs))
+            return RemoteResult::fail("fade_ms must be 0-" + std::to_string(TakeFade::kMaxFadeMs) + " (0 = cut)");
         if (a == "source") {
-            if (!c.has("name")) return RemoteResult::fail("name is missing (empty name = no source)");
+            if (!c.has("name")) return RemoteResult::fail("name is missing (empty name = None, a black output)");
             if (!receiver) return RemoteResult::fail("The NDI runtime is not loaded", 409);
             const std::string name = c.param("name");
-            selectSource(name);
-            return {true, name.empty() ? std::string("No source") : "Showing " + name};
+            selectSource(name, fadeMs);
+            return {true, name.empty() ? std::string("None (black output)") : "Showing " + name};
         }
         if (a == "reconnect") {
             if (!receiver || receiver->source().empty()) return RemoteResult::fail("No source selected", 409);
             const std::string name = receiver->source();
-            selectSource(name);
+            selectSource(name, fadeMs);
             return {true, "Reconnecting to " + name};
         }
         if (a == "volume") {
@@ -958,14 +1223,28 @@ int main(int argc, char** argv) {
             if (v.empty() || v.find_first_not_of("+-0123456789") != std::string::npos)
                 return RemoteResult::fail("value must be 0-100, or +N / -N to step");
             const int n = std::atoi(v.c_str());
-            settings.volume = std::clamp((v[0] == '+' || v[0] == '-') ? settings.volume + n : n, 0, 100);
-            return {true, "Volume " + std::to_string(settings.volume) + "%"};
+            setVolume((v[0] == '+' || v[0] == '-') ? volumeNow() + n : n);
+            return {true, (systemAudio.available() ? "System volume " : "Volume ") + std::to_string(volumeNow()) + "%"};
         }
         if (a == "mute") {
-            auto on = parseSwitch(c, "on", settings.muted);
+            auto on = parseSwitch(c, "on", mutedNow());
             if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
-            settings.muted = *on;
+            setMuted(*on);
             return {true, *on ? "Muted" : "Unmuted"};
+        }
+        if (a == "audio-output") {
+            if (!systemAudio.available())
+                return RemoteResult::fail("Choosing the sound output isn't possible on this computer", 409);
+            const std::string id = c.param("id");
+            if (id.empty()) return RemoteResult::fail("id is missing (see audio.outputs in the state)");
+            if (!systemAudio.setDefaultOutput(id)) return RemoteResult::fail(systemAudio.error(), 404);
+            return {true, "Sound output: " + systemAudio.defaultOutputName()};
+        }
+        if (a == "allow-notification-control") {
+            if (!silencer.supported()) return RemoteResult::fail("Not available on this operating system", 409);
+            if (silencer.permitted()) return {true, "FeedView can already switch notifications off"};
+            silencer.requestPermission();
+            return {true, "Confirm the Windows prompt on the FeedView computer"};
         }
         if (a == "audio-pair") {
             const int first = std::atoi(c.param("first").c_str());  // 1, 3, 5 ...
@@ -975,15 +1254,28 @@ int main(int argc, char** argv) {
             return {true, "Audio channels " + std::to_string(first) + "-" + std::to_string(first + 1)};
         }
         if (a == "settings") {
-            for (const char* k : {"start_fullscreen", "show_info", "clean_output"}) {
+            const std::pair<const char*, bool*> flags[] = {
+                {"start_fullscreen", &settings.startFullscreen},
+                {"show_info", &settings.showInfo},
+                {"clean_output", &settings.cleanOutput},
+                {"always_on_top", &settings.alwaysOnTop},
+                {"silence_notifications", &settings.silenceNotifications},
+            };
+            for (const auto& [k, field] : flags) {
                 if (!c.has(k)) continue;
-                bool* field = std::string(k) == "start_fullscreen" ? &settings.startFullscreen
-                              : std::string(k) == "show_info"      ? &settings.showInfo
-                                                                   : &settings.cleanOutput;
                 auto v = parseSwitch(c, k, *field);
                 if (!v) return RemoteResult::fail(std::string(k) + " must be 1, 0 or toggle");
                 *field = *v;
             }
+            if (c.has("always_on_top")) {
+                onTopSuspended = false;
+                if (settings.alwaysOnTop)
+                    raise();
+                else
+                    applyOnTop();
+            }
+            if (c.has("silence_notifications")) applyNotificationSetting();
+            if (c.has("fade_ms")) settings.fadeMs = fadeMs;
             if (c.has("extra_ips")) {
                 const std::string ips = c.param("extra_ips");
                 if (ips.size() >= sizeof extraIpsBuf) return RemoteResult::fail("extra_ips is too long");
@@ -998,17 +1290,29 @@ int main(int argc, char** argv) {
         return RemoteResult::fail("Unknown command", 404);
     };
     Uint64 lastStatePublish = 0, lastPreviewTicks = 0;
-    uint64_t lastPreviewSerial = 0;
+    uint64_t previewSerial = 0;
     bool previewPublished = false;
+
+    if (settings.silenceNotifications && silencer.supported() && !silencer.permitted())
+        notify("To switch Windows notifications off during the show, FeedView needs a one-time permission: "
+               "Settings > Allow");
 
     // ---- Main loop
     bool running = true;
-    Uint64 lastActivity = SDL_GetTicks();
+    bool toggleRemotePanel = false;  // R key
     Uint64 lastSaveCheck = 0;
     Uint64 lastFrameTicks = SDL_GetTicksNS();
-    bool cursorVisible = true;
 
     while (running) {
+        {
+            const Uint64 t = SDL_GetTicks();
+            const Uint64 gap = lastLoopTicks ? t - lastLoopTicks : 0;
+            if (gap >= frameGap || t - frameGapAt > 5000) {
+                frameGap = gap;
+                frameGapAt = t;
+            }
+            lastLoopTicks = t;
+        }
         if (finder) sources = finder->sources();
 
         // If the selected source shows up after we connected (common at startup, and the only
@@ -1018,7 +1322,7 @@ int main(int argc, char** argv) {
             const std::string url = urlFor(receiver->source());
             if (!url.empty() && url != receiver->url() && !receiver->status().connected) {
                 receiver->connect(receiver->source(), url);
-                audio.flush();
+                audio->flush();
                 lastConnect = SDL_GetTicks();
             }
         }
@@ -1060,12 +1364,26 @@ int main(int argc, char** argv) {
                 case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
                     if (e.window.windowID == mainWindowId) dm.windowLeftFullscreen(SDL_GetTicks());
                     break;
+                case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                    if (e.window.windowID == mainWindowId && onTopSuspended) {  // clicked back into FeedView
+                        onTopSuspended = false;
+                        applyOnTop();
+                    }
+                    break;
                 case SDL_EVENT_MOUSE_MOTION:
+                    activity.mouseMoved(SDL_GetTicks());
+                    break;
                 case SDL_EVENT_MOUSE_WHEEL:
-                    lastActivity = SDL_GetTicks();
+                case SDL_EVENT_TEXT_INPUT:
+                    activity.input(SDL_GetTicks());
                     break;
                 case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                    lastActivity = SDL_GetTicks();
+                    // A click on controls that are showing is deliberate use (they show without
+                    // the mouse while there's no picture); a click on the picture shows nothing.
+                    if (lastOverlayShown)
+                        activity.show(SDL_GetTicks());
+                    else
+                        activity.input(SDL_GetTicks());
                     if (e.button.windowID != mainWindowId) {
                         const int idx = identify.hitTest(e.button.windowID);
                         if (idx >= 0) {
@@ -1078,6 +1396,7 @@ int main(int argc, char** argv) {
                     }
                     break;
                 case SDL_EVENT_KEY_DOWN: {
+                    activity.input(SDL_GetTicks());
                     const bool volumeKey = e.key.key == SDLK_UP || e.key.key == SDLK_DOWN;
                     if (io.WantTextInput || (e.key.repeat && !volumeKey)) break;
                     const SDL_Keycode k = e.key.key;
@@ -1095,9 +1414,9 @@ int main(int argc, char** argv) {
                         dm.chooseDisplay(digit - 1, true, t);
                     } else if (digit == 0) {
                         if (identify.active()) identify.hide();
-                        else if (!cmd) selectSource("");
+                        else if (!cmd) selectSource("", settings.fadeMs);
                     } else if (digit >= 1) {
-                        if (size_t(digit - 1) < sources.size()) selectSource(sources[digit - 1].name);
+                        if (size_t(digit - 1) < sources.size()) selectSource(sources[digit - 1].name, settings.fadeMs);
                     } else if (k == SDLK_D) {
                         toggleIdentify();
                     } else if (k == SDLK_F || k == SDLK_F11) {
@@ -1109,14 +1428,17 @@ int main(int argc, char** argv) {
                         else if (identify.active()) identify.hide();
                         else if (dm.wantFullscreen()) dm.setFullscreen(false, t);
                     } else if (k == SDLK_M) {
-                        settings.muted = !settings.muted;
-                        lastActivity = SDL_GetTicks();
+                        setMuted(!mutedNow());
+                        activity.show(t);
                     } else if (k == SDLK_UP || k == SDLK_DOWN) {
-                        settings.volume = std::clamp(settings.volume + (k == SDLK_UP ? 5 : -5), 0, 100);
-                        settings.muted = false;
-                        lastActivity = SDL_GetTicks();
+                        setVolume(volumeNow() + (k == SDLK_UP ? 5 : -5));
+                        setMuted(false);
+                        activity.show(t);
                     } else if (k == SDLK_I) {
                         settings.showInfo = !settings.showInfo;
+                    } else if (k == SDLK_R && !cmd) {
+                        activity.show(t);
+                        toggleRemotePanel = true;
                     }
                     break;
                 }
@@ -1145,6 +1467,28 @@ int main(int argc, char** argv) {
                     applyUiStyle(uiScale);
                 }
             }
+            // The fullscreen output stays above everything, the taskbar and other
+            // always-on-top programs included (they may push themselves up again).
+            if (wantOnTop() && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) && t - lastOnTopCheck >= 500) {
+                lastOnTopCheck = t;
+                os::keepOnTop(nativeWindow);
+            }
+        }
+
+        // ---- OS state: volume/outputs changed elsewhere, notification permission given
+        {
+            const Uint64 t = SDL_GetTicks();
+            systemAudio.update(t);
+            const bool pending = silencer.permissionPending();
+            if (permissionWasPending && !pending) {
+                if (silencer.permitted()) {
+                    applyNotificationSetting();
+                    notify("FeedView may now switch notifications off. " + notificationStatus());
+                } else {
+                    notify(silencer.lastError().empty() ? "The permission was not given" : silencer.lastError());
+                }
+            }
+            permissionWasPending = pending;
         }
 
         // ---- Web remote: run queued commands, publish state and preview frames
@@ -1162,52 +1506,70 @@ int main(int argc, char** argv) {
                     remote.publishState(remoteState());
                     lastStatePublish = t;
                 }
-                if (!lastHasPicture) {
+                if (!lastOutputPicture) {
                     if (previewPublished) remote.clearPreview();
                     previewPublished = false;
-                } else if (remote.previewWanted() && frame.serial != lastPreviewSerial && t - lastPreviewTicks >= 200) {
-                    int pw = 0, ph = 0;
-                    std::vector<uint8_t> rgb = makePreview(frame, 640, pw, ph);
-                    if (!rgb.empty()) {
-                        remote.publishPreview(std::move(rgb), pw, ph, frame.serial);
-                        previewPublished = true;
+                } else if (remote.previewWanted() && t - lastPreviewTicks >= 200) {
+                    // What the output mostly shows: the new source, or the old one while it dominates.
+                    const VideoFrame& shown = lastPreviewFromOutgoing ? outgoing.frame : frame;
+                    const uint64_t key = shown.serial * 2 + (lastPreviewFromOutgoing ? 1 : 0);
+                    if (shown.serial && key != lastPreviewKey) {
+                        int pw = 0, ph = 0;
+                        std::vector<uint8_t> rgb = makePreview(shown, 640, pw, ph);
+                        if (!rgb.empty()) {
+                            remote.publishPreview(std::move(rgb), pw, ph, ++previewSerial);
+                            previewPublished = true;
+                        }
+                        lastPreviewKey = key;
+                        lastPreviewTicks = t;
                     }
-                    lastPreviewSerial = frame.serial;
-                    lastPreviewTicks = t;
                 }
             }
         }
 
+        // ---- Fade between sources: this frame's mix; the old source goes once it's faded out
+        auto updateMix = [&]() {
+            mix = fade.update(SDL_GetTicks());
+            if (mix.finished) dropOutgoing();
+            audio->setGain(appGain() * mix.soundIn);
+            fadeAudio->setGain(appGain() * mix.soundOut);
+        };
+
         if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
+            updateMix();
+            lastOverlayShown = false;
+            lastCursorShown = false;
+            lastPanel.clear();
+            lastUiRects.clear();
             SDL_Delay(20);
             continue;
         }
 
-        // ---- New video frame -> texture
+        // ---- New video frames -> textures
         if (receiver && receiver->fetchVideo(frame)) {
-            if (!texture || texW != frame.width || texH != frame.height) {
-                if (texture) SDL_DestroyTexture(texture);
-                texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_BGRA32, SDL_TEXTUREACCESS_STREAMING,
-                                            frame.width, frame.height);
-                texW = frame.width;
-                texH = frame.height;
-                if (texture) SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
-            }
-            if (texture) {
-                SDL_SetTextureBlendMode(texture, frame.hasAlpha ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
-                SDL_UpdateTexture(texture, nullptr, frame.pixels.data(), frame.width * 4);
+            upload(frame, texture, texW, texH, texAlpha);
+            if (!firstFrameSeen) {
+                firstFrameSeen = true;
+                fade.firstFrame(SDL_GetTicks());
             }
         }
+        if (outgoing.rx && outgoing.rx->fetchVideo(outgoing.frame))
+            upload(outgoing.frame, outgoing.tex, outgoing.texW, outgoing.texH, outgoing.texAlpha);
+        updateMix();
         const ReceiverStatus st = receiver ? receiver->status() : ReceiverStatus{};
         const bool hasPicture = texture && frame.serial != 0;
+        const bool fadingPicture = fade.active() && outgoing.hasPicture() && mix.outgoing > 0.0f;
+        const bool outputPicture = hasPicture || fadingPicture;
         // A picture with no fresh frames (or kept across a reconnect) is flagged, never shown as live.
         const bool signalLost = hasPicture && (st.secondsSinceVideo > 1.0 || st.secondsSinceVideo < 0);
         lastStatus = st;
         lastHasPicture = hasPicture;
         lastSignalLost = signalLost;
+        lastOutputPicture = outputPicture;
+        lastPreviewFromOutgoing = fadingPicture && (!hasPicture || mix.outgoing >= mix.incoming);
 
-        audio.setGain(volumeToGain(settings.volume, settings.muted));
         if (receiver && receiver->audioPair() != settings.audioPair) receiver->setAudioPair(settings.audioPair);
+        if (outgoing.rx && outgoing.rx->audioPair() != settings.audioPair) outgoing.rx->setAudioPair(settings.audioPair);
 
         // ---- UI
         ImGui_ImplSDLRenderer3_NewFrame();
@@ -1217,18 +1579,33 @@ int main(int argc, char** argv) {
 
         const Uint64 now = SDL_GetTicks();
         const bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-        // The operator is using FeedView's own controls right now.
-        const bool localInteraction = popupOpen || identify.active() || io.WantCaptureMouse ||
-                                      (now - lastActivity) < Uint64(kOverlayHideSeconds * 1000);
-        // Clean output: nothing of FeedView's own is drawn over the fullscreen picture unless
-        // the operator is using the controls; status is in the web remote instead.
+        // Is the operator using FeedView's own controls right now? (see overlay_activity.h)
+        const OverlayActivity::Frame act = activity.update(now, popupOpen);
+        if (act.closePanels) closePopups = true;
+        const bool localInteraction = act.visible || identify.active();
+        // None is the safe choice when there's nothing to show: a plain black output.
+        const bool noneSelected = receiver && receiver->source().empty();
+        // Nothing of FeedView's own is drawn over the output unless the operator is using the
+        // controls: with None, and with Clean output on the fullscreen picture. Status is in
+        // the web remote instead.
         const bool quietOutput =
-            settings.cleanOutput && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) && !localInteraction;
-        const bool showOverlay =
-            localInteraction || !runtime.loaded() || (!quietOutput && (!hasPicture || signalLost));
+            !localInteraction &&
+            (noneSelected || (settings.cleanOutput && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN)));
+        // A source just taken gets as long as a fade waits for it to send its first frame
+        // before FeedView says it has no picture: a take from black then simply fades in,
+        // with no "Connecting..." text or toolbar flashing up on the output.
+        const bool connecting = receiver && !receiver->source().empty() && !hasPicture &&
+                                now - lastConnect < TakeFade::kMaxWaitMs;
+        const bool noPicture = !outputPicture && !connecting;
+        // A source that shows no picture brings up the bar by itself, unless the web remote
+        // hid the controls. Open menus get one more frame to close.
+        const bool showOverlay = localInteraction || (closePopups && popupOpen) || !runtime.loaded() ||
+                                 (!quietOutput && !activity.dismissed() && (noPicture || signalLost));
         const ImVec2 view = io.DisplaySize;
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
         float barHeight = 0.0f;
+        std::string panelNow;  // which menu/panel is open, for the web remote
+        uiRectsNow.clear();
 
         if (!runtime.loaded()) {
             ImGui::SetNextWindowPos(ImVec2(view.x * 0.5f, view.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -1256,7 +1633,7 @@ int main(int argc, char** argv) {
             ImGui::SameLine();
             if (ImGui::Button("Try again") && runtime.load(appDir)) {
                 startNdi();
-                if (!settings.source.empty()) selectSource(settings.source);
+                if (!settings.source.empty()) selectSource(settings.source, settings.fadeMs);
             }
             if (ImGui::CollapsingHeader("Places searched")) {
                 for (const auto& p : runtime.triedPaths()) ImGui::TextDisabled("%s", p.c_str());
@@ -1265,20 +1642,9 @@ int main(int argc, char** argv) {
         } else {
             // Centre messages
             const ImVec2 center(view.x * 0.5f, view.y * 0.5f);
-            if (quietOutput) {
-                // black, by request
-            } else if (receiver && receiver->source().empty()) {
-                centeredText(bg, center, "Select an NDI source", 1.6f, IM_COL32(230, 230, 230, 255));
-                centeredText(bg, ImVec2(center.x, center.y + ImGui::GetFontSize() * 2.0f),
-                             sources.empty() ? "Searching the network..." : "Use the Source menu above, or press 1-9",
-                             1.0f, IM_COL32(150, 150, 150, 255));
-                const auto urls = remoteUrls();
-                if (!urls.empty()) {
-                    const std::string line = "Web remote: " + urls.front();
-                    centeredText(bg, ImVec2(center.x, view.y - ImGui::GetFontSize() * 2.0f), line.c_str(), 1.0f,
-                                 IM_COL32(120, 120, 120, 255));
-                }
-            } else if (!hasPicture) {
+            if (quietOutput || noneSelected) {
+                // black: None, or Clean output by request
+            } else if (noPicture) {
                 std::string msg = st.connected ? "Waiting for video from " : "Connecting to ";
                 msg += receiver->source();
                 centeredText(bg, center, msg.c_str(), 1.3f, IM_COL32(220, 220, 220, 255));
@@ -1301,7 +1667,8 @@ int main(int argc, char** argv) {
                 ImGui::SetNextItemWidth(std::clamp(view.x * 0.38f, 180.0f * uiScale, 440.0f * uiScale));
                 if (ImGui::BeginCombo("##source", cur.empty() ? "None" : cur.c_str(), ImGuiComboFlags_HeightLarge)) {
                     if (closePopups) ImGui::CloseCurrentPopup();
-                    if (ImGui::Selectable("    None", cur.empty())) selectSource("");
+                    panelNow = "menu";
+                    if (ImGui::Selectable("0   None (black)", cur.empty())) selectSource("", settings.fadeMs);
                     for (size_t i = 0; i < sources.size(); ++i) {
                         char label[600];
                         if (i < 9)
@@ -1309,7 +1676,7 @@ int main(int argc, char** argv) {
                         else
                             std::snprintf(label, sizeof label, "    %s", sources[i].name.c_str());
                         bool selected = sources[i].name == cur;
-                        if (ImGui::Selectable(label, selected)) selectSource(sources[i].name);
+                        if (ImGui::Selectable(label, selected)) selectSource(sources[i].name, settings.fadeMs);
                         if (selected) ImGui::SetItemDefaultFocus();
                     }
                     if (!cur.empty() && urlFor(cur).empty() &&
@@ -1331,6 +1698,7 @@ int main(int argc, char** argv) {
                 ImGui::SetNextItemWidth(92.0f * uiScale);
                 if (ImGui::BeginCombo("##pair", pairLabel(settings.audioPair, chans).c_str())) {
                     if (closePopups) ImGui::CloseCurrentPopup();
+                    panelNow = "menu";
                     int pairs = std::max(1, (chans + 1) / 2);
                     for (int p = 0; p < pairs; ++p) {
                         if (ImGui::Selectable(pairLabel(p * 2, chans).c_str(), settings.audioPair == p * 2))
@@ -1339,10 +1707,14 @@ int main(int argc, char** argv) {
                     ImGui::EndCombo();
                 }
                 ImGui::SameLine();
-                ImGui::Checkbox("Mute", &settings.muted);
+                bool muted = mutedNow();
+                if (ImGui::Checkbox("Mute", &muted)) setMuted(muted);
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(110.0f * uiScale);
-                ImGui::SliderInt("##volume", &settings.volume, 0, 100, "%d%%");
+                int volume = volumeNow();
+                if (ImGui::SliderInt("##volume", &volume, 0, 100, "%d%%")) setVolume(volume);
+                if (systemAudio.available())
+                    ImGui::SetItemTooltip("System volume (%s)", systemAudio.defaultOutputName().c_str());
 
                 // Fullscreen + display choice
                 const auto& screens = dm.displays();
@@ -1353,11 +1725,13 @@ int main(int argc, char** argv) {
                                       : dm.wantFullscreen()    ? "Exit fullscreen"
                                                                : "Fullscreen";
                 if (ImGui::Button(fsLabel)) dm.toggleFullscreen(now);
+                markUi("fullscreen_button");
                 if (showScreens && !screens.empty()) {
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(230.0f * uiScale);
                     if (ImGui::BeginCombo("##display", dm.targetLabel().c_str(), ImGuiComboFlags_HeightLarge)) {
-                    if (closePopups) ImGui::CloseCurrentPopup();
+                        if (closePopups) ImGui::CloseCurrentPopup();
+                        panelNow = "menu";
                         for (int i = 0; i < int(screens.size()); ++i)
                             if (ImGui::Selectable(dm.label(i).c_str(), i == ti)) dm.chooseDisplay(i, false, now);
                         if (ti < 0 && !dm.target().name.empty()) {
@@ -1375,8 +1749,10 @@ int main(int argc, char** argv) {
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Settings")) ImGui::OpenPopup("settings");
+                markUi("settings_button");
                 if (ImGui::BeginPopup("settings")) {
                     if (closePopups) ImGui::CloseCurrentPopup();
+                    panelNow = "settings";
                     ImGui::TextUnformatted("Extra discovery IPs");
                     ImGui::TextDisabled("For sources on other subnets/VLANs, e.g. 10.0.1.20,10.0.2.0");
                     ImGui::SetNextItemWidth(300.0f * uiScale);
@@ -1394,10 +1770,52 @@ int main(int argc, char** argv) {
                     ImGui::Checkbox("Clean output", &settings.cleanOutput);
                     ImGui::SameLine();
                     ImGui::TextDisabled("no messages over the fullscreen picture");
+                    ImGui::SetNextItemWidth(160.0f * uiScale);
+                    ImGui::SliderInt("Fade between sources", &settings.fadeMs, 0, 3000,
+                                     settings.fadeMs == 0 ? "Cut" : "%d ms", ImGuiSliderFlags_AlwaysClamp);
+                    bool onTop = settings.alwaysOnTop;
+                    if (ImGui::Checkbox("Always on top", &onTop)) {
+                        settings.alwaysOnTop = onTop;
+                        onTopSuspended = false;
+                        applyOnTop();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("above other windows; fullscreen also above the taskbar");
+                    if (silencer.supported()) {
+                        bool silence = settings.silenceNotifications;
+                        if (ImGui::Checkbox("Silence notifications while FeedView runs", &silence)) {
+                            settings.silenceNotifications = silence;
+                            applyNotificationSetting();
+                        }
+                        ImGui::Indent();
+                        ImGui::TextDisabled("%s", notificationStatus().c_str());
+                        if (settings.silenceNotifications && !silencer.permitted()) {
+                            ImGui::SameLine();
+                            ImGui::BeginDisabled(silencer.permissionPending());
+                            if (ImGui::SmallButton("Allow...")) silencer.requestPermission();
+                            ImGui::EndDisabled();
+                        }
+                        ImGui::Unindent();
+                    }
+                    if (systemAudio.available()) {
+                        ImGui::Separator();
+                        ImGui::TextUnformatted("Sound output");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("the computer's default; the volume is the system volume");
+                        ImGui::SetNextItemWidth(380.0f * uiScale);
+                        if (ImGui::BeginCombo("##output", systemAudio.defaultOutputName().c_str())) {
+                            for (const auto& o : systemAudio.outputs())
+                                if (ImGui::Selectable(o.name.c_str(), o.isDefault) && !o.isDefault &&
+                                    !systemAudio.setDefaultOutput(o.id))
+                                    notify(systemAudio.error());
+                            ImGui::EndCombo();
+                        }
+                    }
                     ImGui::Separator();
                     ImGui::TextDisabled("Keys: F fullscreen, Esc leave, 1-9 source, 0 none,");
                     ImGui::TextDisabled("D identify displays, Ctrl+1-9 fullscreen on display N,");
-                    ImGui::TextDisabled("M mute, Up/Down volume, I info. Double-click = fullscreen.");
+                    ImGui::TextDisabled("M mute, Up/Down volume, I info, R web remote.");
+                    ImGui::TextDisabled("Double-click = fullscreen. Move the mouse for a second to show the controls.");
                     ImGui::Separator();
                     ImGui::TextDisabled("FeedView %s", FEEDVIEW_VERSION);
                     ImGui::TextDisabled("Runtime: %s", runtime.versionString().c_str());
@@ -1406,12 +1824,23 @@ int main(int argc, char** argv) {
                 }
                 ImGui::SameLine();
                 const auto clients = remote.recentClients(15);
-                if (ImGui::Button(clients.empty() ? "Remote" : "Remote (in use)")) {
+                bool openRemotePanel = ImGui::Button(clients.empty() ? "Remote" : "Remote (in use)");
+                markUi("remote_button");
+                const ImVec2 belowRemoteButton(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y);
+                if (toggleRemotePanel) {
+                    if (ImGui::IsPopupOpen("remote"))
+                        closePopups = true;
+                    else
+                        openRemotePanel = true;
+                }
+                if (openRemotePanel) {
                     localAddresses = localIPv4Addresses();
                     ImGui::OpenPopup("remote");
                 }
+                ImGui::SetNextWindowPos(belowRemoteButton, ImGuiCond_Appearing);  // also when opened with R
                 if (ImGui::BeginPopup("remote")) {
                     if (closePopups) ImGui::CloseCurrentPopup();
+                    panelNow = "remote";
                     ImGui::PushFont(nullptr, style.FontSizeBase * 1.25f);
                     ImGui::TextUnformatted("Web remote");
                     ImGui::PopFont();
@@ -1422,15 +1851,31 @@ int main(int argc, char** argv) {
                         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
                                            "This computer has no network connection right now.");
                     } else {
-                        const std::string qrText =
-                            urls.front() + (settings.remoteRequirePin ? "/#pin=" + settings.remotePin : "/");
-                        drawQrCode(qrText, 190.0f * uiScale);
+                        drawQrCode(remoteLink(urls.front(), settings.remoteRequirePin, settings.remotePin),
+                                   190.0f * uiScale);
+                        markUi("remote_qr");
                         ImGui::SameLine();
                         ImGui::BeginGroup();
                         ImGui::TextUnformatted("Scan the code, or open this on a phone or");
                         ImGui::TextUnformatted("computer on the same network:");
                         ImGui::Spacing();
-                        for (const auto& u : urls) ImGui::TextUnformatted(u.c_str());
+                        std::string open;  // a link was clicked
+                        for (const auto& u : urls) {
+                            if (ImGui::TextLink(u.c_str())) open = u;
+                            if (&u == &urls.front()) markUi("remote_link");
+                            ImGui::SetItemTooltip("Open in this computer's browser");
+                        }
+                        ImGui::Spacing();
+                        if (ImGui::Button("Open in browser") || ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                            ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))
+                            open = urls.front();
+                        markUi("open_browser");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(Enter)");
+                        if (!open.empty()) {
+                            openRemoteLink(open);
+                            ImGui::CloseCurrentPopup();
+                        }
                         if (settings.remoteRequirePin) {
                             ImGui::Spacing();
                             ImGui::AlignTextToFramePadding();
@@ -1493,7 +1938,7 @@ int main(int argc, char** argv) {
                                        st.audioSampleRate / 1000.0, st.audioChannels,
                                        pairLabel(playing, st.audioChannels).c_str());
                     if (haveAudio && n > 0 && n < int(sizeof info))
-                        n += std::snprintf(info + n, sizeof info - n, ", buffer %.0f ms", audio.bufferMs());
+                        n += std::snprintf(info + n, sizeof info - n, ", buffer %.0f ms", audio->bufferMs());
                 }
                 if (n > 0 && n < int(sizeof info) && st.droppedVideoFrames > 0)
                     std::snprintf(info + n, sizeof info - n, "  |  dropped %lld", (long long)st.droppedVideoFrames);
@@ -1530,13 +1975,16 @@ int main(int argc, char** argv) {
         }
         if (!quietOutput) drawToasts(toasts, now, view, barHeight + 10.0f * uiScale, uiScale);
         localAction = false;
+        toggleRemotePanel = false;
+        lastOverlayShown = showOverlay;
+        lastPanel = panelNow;
+        lastUiRects.swap(uiRectsNow);
 
-        // Hide the mouse pointer together with the overlay.
-        const bool wantCursor = showOverlay || !runtime.loaded();
-        if (wantCursor != cursorVisible) {
-            wantCursor ? SDL_ShowCursor() : SDL_HideCursor();
-            cursorVisible = wantCursor;
-        }
+        // The mouse pointer: hidden 2 s after the last input, back after a second of moving.
+        // ImGui's SDL backend sets the OS pointer every frame (shape, shown/hidden), so it's
+        // hidden by asking ImGui for none; calling SDL_HideCursor here would be undone.
+        lastCursorShown = act.cursor;
+        if (!act.cursor) ImGui::SetMouseCursor(ImGuiMouseCursor_None);
 
         ImGui::Render();
 
@@ -1544,17 +1992,29 @@ int main(int argc, char** argv) {
         SDL_SetRenderScale(renderer, 1.0f, 1.0f);
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
-        if (hasPicture) {
-            int ow = 0, oh = 0;
-            SDL_GetCurrentRenderOutputSize(renderer, &ow, &oh);
-            float aspect = frame.aspect > 0 ? frame.aspect : float(frame.width) / float(frame.height);
+        int ow = 0, oh = 0;
+        SDL_GetCurrentRenderOutputSize(renderer, &ow, &oh);
+        // Letterboxed, at `opacity`. Over black, the old picture at 1-a plus the new one added
+        // at a is a true dissolve, also where their sizes differ.
+        auto drawPicture = [&](SDL_Texture* tex, const VideoFrame& f, float opacity, SDL_BlendMode mode) {
+            const float aspect = f.aspect > 0 ? f.aspect : float(f.width) / float(f.height);
             float w = float(ow), h = w / aspect;
             if (h > oh) {
                 h = float(oh);
                 w = h * aspect;
             }
-            SDL_FRect dst{std::floor((ow - w) * 0.5f), std::floor((oh - h) * 0.5f), std::round(w), std::round(h)};
-            SDL_RenderTexture(renderer, texture, nullptr, &dst);
+            const SDL_FRect dst{std::floor((ow - w) * 0.5f), std::floor((oh - h) * 0.5f), std::round(w), std::round(h)};
+            SDL_SetTextureAlphaModFloat(tex, opacity);
+            SDL_SetTextureBlendMode(tex, mode);
+            SDL_RenderTexture(renderer, tex, nullptr, &dst);
+            return dst;
+        };
+        if (fadingPicture) drawPicture(outgoing.tex, outgoing.frame, mix.outgoing, SDL_BLENDMODE_BLEND);
+        if (hasPicture && mix.incoming > 0.0f) {
+            const SDL_BlendMode mode = fadingPicture                              ? SDL_BLENDMODE_ADD
+                                       : (mix.incoming < 1.0f || frame.hasAlpha) ? SDL_BLENDMODE_BLEND
+                                                                                 : SDL_BLENDMODE_NONE;
+            const SDL_FRect dst = drawPicture(texture, frame, mix.incoming, mode);
             if (signalLost && !quietOutput) {
                 SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
                 SDL_SetRenderDrawColor(renderer, 0, 0, 0, 170);
@@ -1578,14 +2038,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Notifications back as they were before FeedView switched them off.
+    if (settings.silencedNotifications && silencer.silence(false, true)) settings.silencedNotifications = false;
     if (!(settings == saved) && !settingsPath.empty()) settings.save(settingsPath);
 
     remote.stop();
     identify.hide();
+    dropOutgoing();
+    retire(nullptr);  // waits for receivers still shutting down
     receiver.reset();
     finder.reset();
-    audio.close();
+    audioA.close();
+    audioB.close();
     if (texture) SDL_DestroyTexture(texture);
+    if (outgoing.tex) SDL_DestroyTexture(outgoing.tex);
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

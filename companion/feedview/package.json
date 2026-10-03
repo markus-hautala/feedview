@@ -1,0 +1,23 @@
+{
+	"name": "feedview",
+	"version": "1.0.0",
+	"description": "Bitfocus Companion module for FeedView, the NDI player",
+	"main": "src/main.js",
+	"scripts": {
+		"test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+		"format": "prettier -w .",
+		"package": "companion-module-build"
+	},
+	"license": "MIT",
+	"engines": {
+		"node": ">=22"
+	},
+	"dependencies": {
+		"@companion-module/base": "~1.14.1"
+	},
+	"devDependencies": {
+		"@companion-module/tools": "^2.6.1",
+		"prettier": "^3.7.4"
+	},
+	"prettier": "@companion-module/tools/.prettierrc.json"
+}

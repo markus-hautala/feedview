@@ -91,6 +91,20 @@ endif()
 add_library(display_manager STATIC src/display_manager.cpp)
 target_include_directories(display_manager PUBLIC src)
 
+# ---- Live production: when the controls show, and what FeedView controls in the OS
+# (system volume/output, notifications, staying on top). No SDL dependency, tested.
+add_library(live_control STATIC src/overlay_activity.cpp src/take_fade.cpp src/os_control.cpp)
+target_include_directories(live_control PUBLIC src)
+if(WIN32)
+  target_link_libraries(live_control PUBLIC ole32 advapi32 userenv shell32 dwmapi user32)
+  target_compile_definitions(live_control PRIVATE _WIN32_WINNT=0x0A00)
+endif()
+
+# ---- Settings file (file access through SDL)
+add_library(settings STATIC src/settings.cpp)
+target_include_directories(settings PUBLIC src)
+target_link_libraries(settings PUBLIC SDL3::SDL3)
+
 # ---- Third-party single-file implementations (built without our warning flags)
 add_library(third_party_impl STATIC src/third_party_impl.cpp ${qrcodegen_SOURCE_DIR}/cpp/qrcodegen.cpp)
 target_include_directories(third_party_impl PUBLIC src ${stb_SOURCE_DIR} ${qrcodegen_SOURCE_DIR}/cpp)
@@ -110,10 +124,9 @@ endif()
 add_executable(feedview WIN32 MACOSX_BUNDLE
   src/main.cpp
   src/ndi_io.cpp
-  src/settings.cpp
   ${FONT_CPP}
   ${PAGE_CPP})
-target_link_libraries(feedview PRIVATE ndi_runtime display_manager remote_server imgui SDL3::SDL3)
+target_link_libraries(feedview PRIVATE ndi_runtime display_manager live_control settings remote_server imgui SDL3::SDL3)
 target_compile_definitions(feedview PRIVATE FEEDVIEW_VERSION="${PROJECT_VERSION}")
 set_target_properties(feedview PROPERTIES OUTPUT_NAME ${APP_NAME})
 if(MSVC)
@@ -147,10 +160,79 @@ if(FEEDVIEW_BUILD_TESTS)
   add_executable(remote_server_test tests/remote_server_test.cpp)
   target_link_libraries(remote_server_test PRIVATE remote_server)
   add_test(NAME remote_server COMMAND remote_server_test)
+  # Live-production rules (controls, PIN default, settings, remote links) - pure logic.
+  add_executable(live_control_test tests/live_control_test.cpp)
+  target_link_libraries(live_control_test PRIVATE live_control settings remote_server)
+  add_test(NAME live_control COMMAND live_control_test)
+  # Against the real OS of this computer: system audio, notifications, window stacking.
+  # Changes are undone at once (volume +-1 and back, notifications restored).
+  add_executable(os_control_test tests/os_control_test.cpp)
+  target_link_libraries(os_control_test PRIVATE live_control)
+  add_test(NAME os_control COMMAND os_control_test)
+  set_tests_properties(os_control PROPERTIES LABELS desktop RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+  # End to end: starts FeedView and the test sender and checks each live-production
+  # requirement through the web remote API, Windows and simulated mouse/keyboard input.
+  # It takes over the screen for about a minute.
+  if(WIN32 AND TARGET feedview_test_sender)
+    add_executable(e2e_test tests/e2e_test.cpp)
+    target_link_libraries(e2e_test PRIVATE live_control remote_server)
+    add_test(NAME e2e COMMAND e2e_test $<TARGET_FILE:feedview> $<TARGET_FILE:feedview_test_sender>)
+    set_tests_properties(e2e PROPERTIES LABELS "desktop;e2e" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+  endif()
+
+  # Your requests (tests/REQUIREMENTS.md): every one has tests, and the ways to run them are
+  # there. A static check with no dependencies, so it runs everywhere (CI too).
+  add_test(NAME requirements_coverage
+           COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_CURRENT_SOURCE_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/requirements_coverage.cmake)
+
+  # The release package to share (scripts/make-release.ps1): only what users need, and the
+  # FeedView in it runs with its bundled NDI runtime. Uses the existing build.
+  if(WIN32)
+    add_test(NAME release_package
+             COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_package_test.ps1
+                     -BuildDir ${CMAKE_BINARY_DIR})
+    set_tests_properties(release_package PROPERTIES TIMEOUT 300)
+  endif()
+
+  # Tests written for Node.js (scenario results as TAP, which scripts/requirements-report reads).
+  find_program(NODE_EXECUTABLE node)
+  set(FEEDVIEW_TEST_ENV "FEEDVIEW_EXE=$<TARGET_FILE:feedview>;FEEDVIEW_SENDER=$<TARGET_FILE:feedview_test_sender>")
+
+  # FeedView's web page in a real browser (headless Edge/Chrome) against the real FeedView:
+  # every control on the page. Needs Node.js 22+ only (no packages); goes fullscreen briefly.
+  if(NODE_EXECUTABLE AND TARGET feedview_test_sender)
+    add_test(NAME web_remote COMMAND ${NODE_EXECUTABLE} --test --test-reporter=tap tests/web/web_remote.test.mjs
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(web_remote PROPERTIES LABELS desktop RUN_SERIAL TRUE TIMEOUT 300 ENVIRONMENT "${FEEDVIEW_TEST_ENV}")
+  endif()
+
+  # The Bitfocus Companion module (companion/feedview, Node.js). Its tests need Node.js and
+  # `npm ci` in that folder (scripts/run-tests does it); without them they're left out.
+  set(COMPANION_DIR ${CMAKE_CURRENT_SOURCE_DIR}/companion/feedview)
+  if(NODE_EXECUTABLE AND EXISTS ${COMPANION_DIR}/node_modules/@companion-module/base)
+    # Logic, and the module as Companion runs it against a stand-in for FeedView's API.
+    add_test(NAME companion_module
+             COMMAND ${NODE_EXECUTABLE} --test --test-concurrency=1 --test-reporter=tap test/logic.test.js test/module.test.js
+             WORKING_DIRECTORY ${COMPANION_DIR})
+    # Every action against the real FeedView (goes fullscreen briefly).
+    if(TARGET feedview_test_sender)
+      add_test(NAME companion_feedview COMMAND ${NODE_EXECUTABLE} --test --test-reporter=tap test/feedview.test.js
+               WORKING_DIRECTORY ${COMPANION_DIR})
+      set_tests_properties(companion_feedview PROPERTIES LABELS desktop RUN_SERIAL TRUE TIMEOUT 300
+        ENVIRONMENT "${FEEDVIEW_TEST_ENV}")
+    endif()
+  else()
+    message(STATUS "Companion module tests left out: needs Node.js and `npm ci` in companion/feedview")
+  endif()
+
+  # Keep every test's whole output (ctest shortens passing tests' output by default), so the
+  # request report sees every scenario.
+  file(WRITE ${CMAKE_BINARY_DIR}/CTestCustom.cmake
+       "set(CTEST_CUSTOM_MAXIMUM_PASSED_TEST_OUTPUT_SIZE 1048576)\nset(CTEST_CUSTOM_MAXIMUM_FAILED_TEST_OUTPUT_SIZE 1048576)\n")
 endif()
 
 foreach(t feedview ndi_runtime display_manager display_manager_test remote_server remote_server_test
-          feedview_test_sender)
+          live_control live_control_test os_control_test e2e_test settings feedview_test_sender)
   if(TARGET ${t})
     if(MSVC)
       target_compile_options(${t} PRIVATE /W3)

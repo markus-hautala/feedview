@@ -8,8 +8,8 @@
 // those, so a slow phone never stalls the picture.
 //
 // Security model (local network, plain HTTP):
-//  * With a PIN (default), every API call must carry it (header X-FeedView-Pin). Wrong
-//    guesses are rate limited per address.
+//  * With a PIN (off by default, turned on in FeedView's Remote panel), every API call must
+//    carry it (header X-FeedView-Pin). Wrong guesses are rate limited per address.
 //  * Commands always need that header, even without a PIN, so a web page opened on some
 //    other computer cannot trigger them (custom headers can't be sent cross-site).
 //  * Without a PIN, requests must use an IP address or a local host name, which blocks

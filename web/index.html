@@ -124,6 +124,9 @@ main { max-width: 1240px; margin: 0 auto; }
 .where { margin: 12px 0 0; color: var(--muted); }
 .where b { color: var(--text); font-weight: 600; }
 .where.warn b { color: var(--amber); }
+.note { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 12px; padding: 8px 8px 8px 12px; border: 1px solid var(--amber); border-radius: var(--r-ctl); background: rgba(240, 168, 28, .08); color: var(--amber); }
+.note span { flex: 1; min-width: 12em; }
+.note .btn { min-height: 40px; padding: 6px 14px; color: var(--text); }
 
 .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .btn {
@@ -171,6 +174,9 @@ main { max-width: 1240px; margin: 0 auto; }
 .audio .seg { grid-column: 1 / -1; justify-self: start; }
 .vol { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .vol output { min-width: 3.2em; text-align: right; font: 500 15px var(--label); }
+.out { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.out label { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.out select { flex: 1; min-width: 0; min-height: 44px; padding: 8px 10px; border-radius: var(--r-ctl); border: 1px solid var(--line); background: var(--raised); }
 input[type=range] { width: 100%; height: 36px; accent-color: #9fb3c8; background: transparent; }
 .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-ctl); overflow: hidden; }
 .seg button { min-height: 44px; padding: 8px 12px; border: 0; background: var(--raised); border-left: 1px solid var(--line); }
@@ -192,7 +198,8 @@ details[open] > summary::before { content: "▾"; }
 .opt label b { display: block; font-weight: 600; }
 .opt label span { font-size: 13px; color: var(--muted); }
 .field { display: flex; gap: 8px; margin-top: 6px; }
-.field input { flex: 1; min-width: 0; min-height: 44px; padding: 8px 10px; border-radius: var(--r-ctl); border: 1px solid var(--line); background: #151a1f; }
+.field input, .field select { flex: 1; min-width: 0; min-height: 44px; padding: 8px 10px; border-radius: var(--r-ctl); border: 1px solid var(--line); background: #151a1f; }
+.field select.fadesel { flex: 0 1 220px; }
 .meta { font-size: 13px; color: var(--muted); margin-top: 12px; overflow-wrap: anywhere; }
 
 footer { padding: 24px var(--gutter) 8px; font-size: 12px; color: var(--muted); text-align: center; }
@@ -237,7 +244,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
 
 <section class="gate" id="gate" hidden>
   <h1>Enter the PIN</h1>
-  <p>Find it in FeedView under <b>Remote</b> (move the mouse over FeedView to show the controls).</p>
+  <p>Find it in FeedView under <b>Remote</b> (press R, or move the mouse over FeedView for a second to show the controls).</p>
   <form id="pinForm" autocomplete="off">
     <input id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" aria-label="PIN" autofocus>
     <button class="btn take" type="submit">Connect</button>
@@ -250,6 +257,8 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     <div class="wall-wrap">
       <div class="wall" id="wall" aria-label="Screens connected to this computer"></div>
       <p class="where" id="where"></p>
+      <div class="note" id="ctlNote" role="status" hidden><span id="ctlText"></span><button class="btn" id="ctlHide">Hide</button></div>
+      <div class="note" id="quietNote" hidden><span id="quietNoteText"></span><button class="btn" id="quietAllow">Allow…</button></div>
       <ul class="screens" id="screens" aria-label="Screens"></ul>
       <div class="row">
         <button class="btn" id="fsBtn"></button>
@@ -271,13 +280,14 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
       <div class="row"><button class="btn" id="reconnectBtn">Reconnect</button></div>
     </section>
     <section class="band">
-      <h2>Audio</h2>
+      <h2>Audio <span class="aside" id="audioAside"></span></h2>
       <div class="audio">
         <button class="btn" id="muteBtn">Mute</button>
         <div class="vol">
           <input type="range" id="vol" min="0" max="100" step="1" aria-label="Volume">
           <output id="volOut" for="vol"></output>
         </div>
+        <div class="out" id="outRow" hidden><label for="outSel">Sound output</label><select id="outSel"></select></div>
         <div class="seg" id="pairs" role="group" aria-label="Audio channels"></div>
       </div>
     </section>
@@ -291,6 +301,12 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
         <div class="opt"><input type="checkbox" id="setClean"><label for="setClean"><b>Clean output</b><span>Nothing from FeedView is drawn over the fullscreen picture (no status text, no dimming). Status stays here.</span></label></div>
         <div class="opt"><input type="checkbox" id="setStartFs"><label for="setStartFs"><b>Start in fullscreen</b><span>When FeedView starts, it goes fullscreen on its display, or waits for it.</span></label></div>
         <div class="opt"><input type="checkbox" id="setInfo"><label for="setInfo"><b>Always show the info line</b><span>Resolution and frame rate in the corner of the picture.</span></label></div>
+        <div class="opt"><input type="checkbox" id="setTop"><label for="setTop"><b>Always on top</b><span>FeedView stays above every other window. When fullscreen also above the taskbar and other always-on-top programs.</span></label></div>
+        <div class="opt"><input type="checkbox" id="setQuiet"><label for="setQuiet"><b>Silence notifications</b><span id="quietText">OS notifications are switched off while FeedView runs.</span></label></div>
+        <div class="opt" style="display:block">
+          <label for="setFade"><b>Fade between sources</b><span> On Take the old picture stays until the new source is up, then dissolves into it. Cut in the Take bar skips the fade once.</span></label>
+          <div class="field"><select id="setFade" class="fadesel"></select></div>
+        </div>
         <div class="opt" style="display:block">
           <label for="setIps"><b>Extra discovery IPs</b><span> For sources on other subnets or VLANs, comma separated.</span></label>
           <div class="field"><input id="setIps" placeholder="10.0.1.20, 10.0.2.15" autocomplete="off"><button class="btn" id="saveIps">Save</button></div>
@@ -306,6 +322,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
 <div class="takebar" id="takebar" hidden>
   <p id="takeText"></p>
   <button class="btn" id="cancelBtn">Cancel</button>
+  <button class="btn" id="cutBtn" title="Switch without a fade">Cut</button>
   <button class="btn take" id="takeBtn">Take</button>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
@@ -372,6 +389,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     $("takeText").innerHTML = "";
     $("takeText").append(kind === "display" ? "Show FeedView fullscreen on " : "Put ", el("b", null, label),
       kind === "display" ? "" : " on the output");
+    $("cutBtn").hidden = kind !== "source";  // Take fades (as set in Settings); Cut switches at once
     $("takebar").hidden = false;
     document.body.classList.add("taking");
     lastSections = {};
@@ -385,15 +403,17 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     if (state) render();
   }
   $("cancelBtn").onclick = clearSelection;
-  $("takeBtn").onclick = async () => {
+  async function take(cut) {
     if (!selection) return;
     const s = selection;
-    $("takeBtn").disabled = true;
+    $("takeBtn").disabled = $("cutBtn").disabled = true;
     const ok = s.kind === "display" ? await cmd("display", { number: s.value, fullscreen: 1 })
-                                    : await cmd("source", { name: s.value });
-    $("takeBtn").disabled = false;
+                                    : await cmd("source", cut ? { name: s.value, fade_ms: 0 } : { name: s.value });
+    $("takeBtn").disabled = $("cutBtn").disabled = false;
     if (ok) clearSelection();
-  };
+  }
+  $("takeBtn").onclick = () => take(false);
+  $("cutBtn").onclick = () => take(true);
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && selection) clearSelection();
     if (e.key === "Enter" && selection && document.activeElement === document.body) $("takeBtn").click();
@@ -407,7 +427,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     return true;
   };
   function splitName(n) {
-    const i = n.lastIndexOf(" (");
+    const i = n.indexOf(" (");  // computer names can't contain " (", source names can
     if (i > 0 && n.endsWith(")")) return { name: n.slice(i + 2, -1), machine: n.slice(0, i) };
     return { name: n, machine: "" };
   }
@@ -419,7 +439,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
 
   function renderWall(s) {
     const o = s.output, ds = s.displays;
-    const key = { ds, o, sel: selection && selection.kind === "display" ? selection.value : 0, w: $("wall").clientWidth, pic: s.source.hasPicture, src: s.source.name };
+    const key = { ds, o, sel: selection && selection.kind === "display" ? selection.value : 0, w: $("wall").clientWidth, pic: s.output.picture, src: s.source.name };
     if (!changed("wall", key)) return;
     const wall = $("wall");
     wall.textContent = "";
@@ -487,8 +507,8 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
       let wb = { x: o.window.x, y: o.window.y, w: o.window.w, h: o.window.h };
       if (o.fullscreen && wd) wb = { x: wd.x, y: wd.y, w: wd.w, h: wd.h - 26 / k };  // keep the label strip visible
       place(win, wb);
-      if (s.source.hasPicture && $("previewOn").checked && previewUrl) win.append(previewImg);
-      else win.append(el("span", "none", !s.source.name ? "No source" : !s.source.hasPicture ? "No picture" : ""));
+      if (s.output.picture && $("previewOn").checked && previewUrl) win.append(previewImg);
+      else win.append(el("span", "none", !s.source.name ? "None (black)" : !s.output.picture ? "No picture" : ""));
       wall.append(win);
     }
   }
@@ -515,6 +535,25 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     idb.disabled = s.displays.length < 2 && !o.identify;
     idb.title = idb.disabled ? "Only one display is connected" : "Shows a big number on every screen, including the projector";
   }
+
+  // FeedView's own controls or panels (e.g. the Remote panel with the QR code) on its screen.
+  function renderNotes(s) {
+    const o = s.output, c = o.controls, n = s.notifications;
+    if (!changed("notes", [c, o.fullscreen, o.window.display, n, s.settings.silenceNotifications])) return;
+    $("ctlNote").hidden = !c.visible;
+    const what = c.panel === "remote" ? "FeedView's Remote panel (QR code) is open"
+               : c.panel === "settings" ? "FeedView's settings are open"
+               : c.panel ? "A FeedView menu is open" : "FeedView's controls are showing";
+    $("ctlText").textContent = what + (o.fullscreen ? ` on the output (display ${o.window.display}).` : " in its window.");
+    // Notifications should be off but aren't (yet): they could pop up on the screens.
+    const quietMissing = n.supported && s.settings.silenceNotifications && !n.silenced;
+    $("quietNote").hidden = !quietMissing;
+    $("quietNoteText").textContent = n.message + ". Notifications can still pop up on the screens.";
+    $("quietAllow").hidden = n.permitted;
+    $("quietAllow").disabled = n.permissionPending;
+  }
+  $("ctlHide").onclick = () => cmd("controls", { on: 0 });
+  $("quietAllow").onclick = () => cmd("allow-notification-control");
 
   function renderScreens(s) {
     const o = s.output, sel = selection && selection.kind === "display" ? selection.value : 0;
@@ -559,6 +598,18 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     list.textContent = "";
     $("srcAside").textContent = s.app.runtimeLoaded ? `${s.sources.length} on the network` : "";
     if (!s.app.runtimeLoaded) { list.append(el("p", "empty", "The NDI runtime isn't installed on the FeedView computer.")); return; }
+    // None is always there: the safe choice when no source is available (a black output).
+    {
+      const isOn = !cur, isSel = selName === "";
+      const b = el("button", "src" + (isOn ? " on" : "") + (isSel ? " sel" : ""));
+      b.type = "button";
+      b.id = "srcNone";
+      const t = el("span", "t");
+      t.append(el("b", null, "None"), el("span", null, "Black output, nothing on screen"));
+      b.append(t, el("span", "tag", isOn ? "On output" : isSel ? "Selected" : ""));
+      b.onclick = () => isOn ? toast("None is already on the output") : select("source", "", "None (black)");
+      list.append(b);
+    }
     const names = s.sources.slice();
     if (cur && !s.source.listed) names.unshift(cur);
     if (!names.length) list.append(el("p", "empty", "Searching the network… Sources appear here as they're found."));
@@ -573,21 +624,12 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
       b.onclick = () => isOn ? toast("Already on the output") : select("source", n, name + (machine ? ` from ${machine}` : ""));
       list.append(b);
     }
-    if (cur) {
-      const b = el("button", "src" + (selName === "" ? " sel" : ""));
-      b.type = "button";
-      const t = el("span", "t");
-      t.append(el("b", null, "No source"), el("span", null, "Black output"));
-      b.append(t, el("span", "tag", selName === "" ? "Selected" : ""));
-      b.onclick = () => select("source", "", "no source (black)");
-      list.append(b);
-    }
     $("reconnectBtn").disabled = !cur;
   }
 
   function renderSignal(s) {
     const src = s.source, v = src.video, a = src.audio;
-    if (!changed("signal", [src, s.audio.bufferMs.toFixed(0)])) return;
+    if (!changed("signal", [src, s.audio.bufferMs.toFixed(0), s.output.fade])) return;
     const alert = $("sigAlert");
     alert.textContent = "";
     $("sigAside").textContent = src.name ? splitName(src.name).name : "";
@@ -595,7 +637,10 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
       const secs = Math.round(v.secondsSinceFrame);
       alert.append(el("p", "alert", src.connected ? `No new video for ${secs} s. The last picture is still showing.` : `Source offline. The last picture is still showing. FeedView reconnects when it comes back.`));
     } else if (src.name && !src.hasPicture) {
-      alert.append(el("p", "alert amber", src.connected ? "Connected, waiting for video…" : "Connecting…"));
+      const fade = s.output.fade;
+      const held = fade && fade.active && fade.waiting && fade.from;
+      alert.append(el("p", "alert amber", (src.connected ? "Connected, waiting for video…" : "Connecting…") +
+        (held ? ` ${splitName(fade.from).name} stays on the output until it's ready (at most 3 s).` : "")));
     }
     const stats = $("stats");
     stats.textContent = "";
@@ -612,6 +657,20 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
   function renderAudio(s) {
     const au = s.audio, ch = s.source.audio.channels;
     if (!volDragging) { $("vol").value = au.volume; $("volOut").textContent = au.volume + "%"; }
+    if (changed("outputs", [au.system, au.output, au.outputs])) {
+      // The volume is the computer's own; the output is the OS default (FeedView plays to it).
+      $("audioAside").textContent = au.system ? "System volume" : "";
+      $("vol").setAttribute("aria-label", au.system ? "System volume" : "Volume");
+      $("outRow").hidden = !au.system || !au.outputs.length;
+      const sel = $("outSel");
+      sel.textContent = "";
+      for (const o of au.outputs) {
+        const op = el("option", null, o.name);
+        op.value = o.id;
+        op.selected = o.id === au.output;
+        sel.append(op);
+      }
+    }
     if (!changed("audio", [au.muted, au.firstChannel, ch])) return;
     const mb = $("muteBtn");
     mb.textContent = au.muted ? "Muted" : "Mute";
@@ -631,6 +690,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     }
   }
   $("muteBtn").onclick = () => cmd("mute", { on: "toggle" });
+  $("outSel").onchange = (e) => cmd("audio-output", { id: e.target.value });
   $("vol").addEventListener("input", (e) => {
     volDragging = true;
     $("volOut").textContent = e.target.value + "%";
@@ -658,11 +718,27 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
   }
 
   function renderSettings(s) {
-    const st = s.settings;
-    if (!changed("settings", [st, s.remote, s.app])) return;
+    const st = s.settings, n = s.notifications;
+    if (!changed("settings", [st, s.remote, s.app, n])) return;
     $("setClean").checked = st.cleanOutput;
     $("setStartFs").checked = st.startFullscreen;
     $("setInfo").checked = st.showInfo;
+    $("setTop").checked = st.alwaysOnTop;
+    const fadeSel = $("setFade");
+    if (document.activeElement !== fadeSel) {  // don't rebuild a list someone has open
+      fadeSel.textContent = "";
+      const steps = [0, 250, 500, 750, 1000, 1500, 2000, 3000];
+      if (!steps.includes(st.fadeMs)) steps.push(st.fadeMs), steps.sort((a, b) => a - b);
+      for (const ms of steps) {
+        const op = el("option", null, ms === 0 ? "Cut (no fade)" : ms < 1000 ? `${ms} ms` : `${ms / 1000} s`);
+        op.value = ms;
+        op.selected = ms === st.fadeMs;
+        fadeSel.append(op);
+      }
+    }
+    $("setQuiet").checked = st.silenceNotifications;
+    $("setQuiet").disabled = !n.supported;
+    $("quietText").textContent = n.message + ".";
     if (document.activeElement !== $("setIps")) $("setIps").value = st.extraIps;
     const others = s.remote.clients.length > 1 ? ` Also in use from ${s.remote.clients.length - 1} other device(s).` : "";
     $("meta").textContent = `FeedView ${s.app.version} on ${s.app.host}. Address: ${s.remote.urls.join(", ")}.` +
@@ -673,6 +749,9 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
   $("setClean").onchange = (e) => cmd("settings", { clean_output: e.target.checked ? 1 : 0 });
   $("setStartFs").onchange = (e) => cmd("settings", { start_fullscreen: e.target.checked ? 1 : 0 });
   $("setInfo").onchange = (e) => cmd("settings", { show_info: e.target.checked ? 1 : 0 });
+  $("setTop").onchange = (e) => cmd("settings", { always_on_top: e.target.checked ? 1 : 0 });
+  $("setFade").onchange = (e) => cmd("settings", { fade_ms: e.target.value });
+  $("setQuiet").onchange = (e) => cmd("settings", { silence_notifications: e.target.checked ? 1 : 0 });
   $("saveIps").onclick = () => cmd("settings", { extra_ips: $("setIps").value.trim() });
   $("forget").onclick = () => { store.clear(); location.reload(); };
 
@@ -695,7 +774,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     document.title = `FeedView on ${s.app.host}`;
     // Drop a selection that no longer makes sense.
     if (selection && selection.kind === "display" && !s.displays.some((d) => d.number === selection.value)) clearSelection();
-    renderWall(s); renderWhere(s); renderScreens(s); renderSources(s); renderSignal(s); renderAudio(s); renderEvents(s); renderSettings(s);
+    renderWall(s); renderWhere(s); renderNotes(s); renderScreens(s); renderSources(s); renderSignal(s); renderAudio(s); renderEvents(s); renderSettings(s);
   }
   window.addEventListener("resize", () => { lastSections.wall = ""; render(); });
 
@@ -757,7 +836,7 @@ body.taking .toast { bottom: calc(env(safe-area-inset-bottom) + 92px); }
     previewBusy = true;
     try {
       while (polling && $("previewOn").checked) {
-        if (!document.hidden && state && state.source.hasPicture) {
+        if (!document.hidden && state && state.output.picture) {
           const r = await api("/api/preview.jpg").catch(() => null);
           if (r && r.status === 200) {
             const blob = await r.blob();

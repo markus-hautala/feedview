@@ -4,6 +4,7 @@
 //   feedview-test-sender --name "Bars" --size 1920x1080 --fps 50 --channels 2
 //
 // Audio channel N carries a (N x 500) Hz tone, so channel 1 = 500 Hz, channel 2 = 1 kHz ...
+// --solid RRGGBB sends one plain colour instead (handy for checking fades between sources).
 
 #include "ndi_runtime.h"
 
@@ -52,6 +53,8 @@ int main(int argc, char** argv) {
     int width = 1920, height = 1080, fpsN = 50, fpsD = 1, channels = 2;
     bool alpha = false;
     double seconds = 0;
+    bool solid = false;
+    Rgb solidColor{0, 0, 0};
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -69,12 +72,22 @@ int main(int argc, char** argv) {
         } else if (a == "--channels") channels = std::atoi(next().c_str());
         else if (a == "--alpha") alpha = true;
         else if (a == "--seconds") seconds = std::atof(next().c_str());
-        else {
-            std::printf("Usage: %s [--name N] [--size WxH] [--fps 50|59.94|N/D] [--channels N] [--alpha] [--seconds S]\n",
+        else if (a == "--solid") {
+            unsigned rgb = 0;
+            if (std::sscanf(next().c_str(), "%6x", &rgb) != 1) {
+                std::fprintf(stderr, "--solid needs a colour like FF0000\n");
+                return 1;
+            }
+            solid = true;
+            solidColor = {((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0, (rgb & 255) / 255.0};
+        } else {
+            std::printf("Usage: %s [--name N] [--size WxH] [--fps 50|59.94|N/D] [--channels N] [--alpha] "
+                        "[--solid RRGGBB] [--seconds S]\n",
                         argv[0]);
             return a == "--help" ? 0 : 1;
         }
     }
+    if (solid) alpha = false;
     width &= ~1;  // UYVY needs an even width
     if (width < 16 || height < 16 || fpsN <= 0 || fpsD <= 0 || channels < 0 || channels > 16) {
         std::fprintf(stderr, "Invalid arguments\n");
@@ -128,7 +141,8 @@ int main(int argc, char** argv) {
             for (int x = 0; x < width; x += 2) {
                 uint8_t* p = &background[size_t(y) * stride + size_t(x) * 2];
                 uint8_t Y = 16, U = 128, V = 128;
-                if (y < barsH) rgbToYuv709(kBars[std::min(6, x * 7 / width)], Y, U, V);
+                if (solid) rgbToYuv709(solidColor, Y, U, V);
+                else if (y < barsH) rgbToYuv709(kBars[std::min(6, x * 7 / width)], Y, U, V);
                 p[0] = U; p[1] = Y; p[2] = V; p[3] = Y;  // UYVY
             }
         }
@@ -140,8 +154,8 @@ int main(int argc, char** argv) {
     double phaseSamples = 0;
     long long samplesSent = 0;
 
-    std::printf("Sending \"%s\": %dx%d @ %d/%d, %s, %d audio channel(s). Ctrl+C to stop.\n", name.c_str(), width,
-                height, fpsN, fpsD, alpha ? "BGRA with alpha" : "UYVY", channels);
+    std::printf("Sending \"%s\": %dx%d @ %d/%d, %s%s, %d audio channel(s). Ctrl+C to stop.\n", name.c_str(), width,
+                height, fpsN, fpsD, alpha ? "BGRA with alpha" : "UYVY", solid ? " solid colour" : "", channels);
     std::fflush(stdout);
 
     const auto start = std::chrono::steady_clock::now();
@@ -158,7 +172,7 @@ int main(int argc, char** argv) {
         int pos = int((n * 8) % period);
         int bx = (pos < travel ? pos : period - pos) & ~1;
         int by = barsH + (height - barsH - box) / 2;
-        for (int y = by; y < by + box && y < height; ++y) {
+        for (int y = by; y < by + box && y < height && !solid; ++y) {
             uint8_t* row = &frameBuf[size_t(y) * stride];
             for (int x = bx; x < bx + box && x < width; x += 2) {
                 if (alpha) {
