@@ -31,11 +31,23 @@ When screens change during an event
   - Start in fullscreen (Settings) + a screen that isn't on yet: FeedView waits for
     it and goes fullscreen as soon as it appears.
 
+Web remote (control FeedView from a phone or another computer)
+  Click Remote in FeedView's toolbar. Scan the QR code with a phone on the same
+  network, or type the address shown there (e.g. http://192.168.1.20:8080) and the PIN.
+  The page shows your screens as arranged, with FeedView's live picture drawn on the
+  screen it's on. Tap a screen or a source, then press Take. Volume and mute act
+  right away. "Show display numbers" puts big numbers on every screen.
+  Settings -> Clean output keeps all FeedView text off the projected picture; status
+  and events are then only in the web remote.
+  Turn it off in the Remote panel. Anyone with the PIN on your network can use it.
+
 First start
   Windows  If SmartScreen says "Windows protected your PC", click More info -> Run anyway
-           (the app is not code-signed). Allow network access if the firewall asks.
+           (the app is not code-signed). When the firewall asks, allow FeedView on
+           Private networks (needed for NDI and the web remote).
   macOS    Right-click FeedView.app -> Open the first time (the app is not notarized).
-           On macOS 15+ allow "Local Network" access, or no sources will be found.
+           On macOS 15+ allow "Local Network" access, or no sources will be found, and
+           allow incoming connections for the web remote.
   Linux    NDI discovery needs avahi-daemon running (installed by default on most
            desktops; otherwise: sudo apt install avahi-daemon).
 
@@ -46,6 +58,7 @@ Sources on another subnet/VLAN
 Command line
   FeedView --source "STUDIO-PC (Program)" --fullscreen --display 2   (2nd screen from left)
   FeedView --list-sources          prints the sources it can see
+  FeedView --remote-port 9000      web remote on another port (--no-remote turns it off)
   FeedView --help                  all options
 
 Test source

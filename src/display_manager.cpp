@@ -238,7 +238,7 @@ void DisplayManager::repair(uint64_t now) {
         if (!parked_) {
             parked_ = true;
             p_.notify("\"" + (target_.name.empty() ? targetLabel() : target_.name) +
-                      "\" disconnected - FeedView returns to it automatically. Press F for fullscreen here.");
+                      "\" disconnected. FeedView returns to it automatically.");
         }
         if (p_.windowFullscreen()) {
             p_.leaveFullscreen();

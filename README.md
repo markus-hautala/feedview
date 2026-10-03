@@ -10,7 +10,11 @@ confidence monitors, multiview spares and quick checks of what's on the network.
 - **Live-safe display handling**: survives monitors being unplugged, re-plugged, rearranged or
   changing resolution without a restart; *Identify* (key **D**) puts a big number on every
   screen — click one to move FeedView there
-- Clear **signal-lost** state (dimmed last frame + red label) and automatic reconnection
+- **Web remote**: open FeedView from a phone or laptop on the same network to see the screen
+  layout with the live picture drawn in place, and switch screens, sources and audio
+  (select, then *Take*). Built in, no installation, works without internet
+- Clear **signal-lost** state (dimmed last frame + red label) and automatic reconnection;
+  *Clean output* keeps the projected picture free of any FeedView text
 - Remembers source, volume, channel pair, display and start-in-fullscreen between runs
 - Scriptable: `--source`, `--fullscreen`, `--display`, `--list-sources`, …
 
@@ -102,6 +106,72 @@ display menu, or **F** while waiting = fullscreen right here. The UI rescales wh
 moves to a monitor with a different scaling factor. On macOS FeedView uses instant
 (non-Spaces) fullscreen so switching never animates or jumps to another Space.
 
+## Web remote
+
+FeedView serves its own control page on port **8080** (or the next free port up to 8089).
+Click **Remote** in FeedView's toolbar to see the address, a QR code and the PIN. Scanning
+the QR code opens the page already signed in. Everything is served by FeedView itself, so
+it works on a closed show network with no internet.
+
+The page shows:
+- **Your screens** as arranged in the OS, with FeedView's live picture drawn where its
+  window is: filling a screen when fullscreen (red label: *On output*), a small rectangle when
+  windowed, and a dashed amber outline for a chosen screen that's disconnected.
+- A list of the screens with resolution, refresh rate, scaling and which is the main display.
+- **Sources** on the network, **signal** details (resolution, frame rate, audio, buffer,
+  dropped frames), **audio** controls, recent **events** and **settings**.
+
+Anything that changes what the audience sees is done in two steps: tap a screen or a
+source (it turns green), then press **Take**. Volume and mute act immediately.
+**Show display numbers** puts the big Identify numbers on every screen (projector
+included) so you can tell them apart.
+
+FeedView's own messages ("projector is back…") are never drawn over the fullscreen picture
+unless someone is using FeedView's controls at the computer; they're listed under *Events* in
+the remote instead. **Clean output** (Settings) goes further: no status text, no dimming,
+no idle messages on the fullscreen output at all, so the last good frame simply stays up if
+a source drops.
+
+### Security
+
+The remote is meant for a trusted local network; it uses plain HTTP.
+- A 4-digit **PIN** is required by default (it's created on first start and can be renewed
+  with *New PIN*). Five wrong guesses from one address pause that address for a minute.
+- Commands only work with the `X-FeedView-Pin` header, which other web sites can't send, so
+  a page open on some other computer can't control FeedView, even without a PIN.
+- Without a PIN, requests must use an IP address or a local name (`.local`, `.lan`, the
+  computer's name), which blocks DNS-rebinding tricks.
+- Turn the remote off in the Remote panel or with `--no-remote`.
+
+First start: Windows asks whether FeedView may use the network. Allow **Private networks**.
+macOS asks whether FeedView may accept incoming connections. Click **Allow**.
+
+### HTTP API (for Companion, Stream Deck, scripts)
+
+All `/api` calls except `ping` need the header `X-FeedView-Pin: <PIN>` (any value if the PIN
+is turned off). Commands are `POST` with form or query parameters and answer
+`{"ok": true|false, "message": "...", "state": {...}}`.
+
+| Request | Parameters | Does |
+|---|---|---|
+| `GET /api/ping` | – | App name, version, host, whether a PIN is needed (no auth) |
+| `GET /api/state` | – | Everything the page shows, as JSON |
+| `GET /api/preview.jpg` | `pin` may be a query parameter | Current picture, 640 px wide (204 if none) |
+| `POST /api/fullscreen` | `on=1\|0\|toggle` | Fullscreen on the chosen display / off |
+| `POST /api/display` | `number=N` (as on the Identify cards), `fullscreen=1\|0` | Put FeedView on display N |
+| `POST /api/identify` | `on=1\|0\|toggle` | Big numbers on every screen |
+| `POST /api/source` | `name=MACHINE (Source)`; empty = no source | Switch source |
+| `POST /api/reconnect` | – | Reconnect the current source |
+| `POST /api/volume` | `value=0-100`, or `+5` / `-5` | Volume |
+| `POST /api/mute` | `on=1\|0\|toggle` | Mute |
+| `POST /api/audio-pair` | `first=1\|3\|5…` | Which channel pair to play |
+| `POST /api/settings` | `clean_output`, `start_fullscreen`, `show_info` (`1\|0`), `extra_ips` | Settings |
+
+```sh
+curl -H "X-FeedView-Pin: 4821" -d number=2 http://192.168.1.20:8080/api/display
+curl -H "X-FeedView-Pin: 4821" --data-urlencode "name=GFX-PC (Program)" http://192.168.1.20:8080/api/source
+```
+
 ## How it works
 
 | File | Role |
@@ -110,6 +180,8 @@ moves to a monitor with a different scaling factor. On macOS FeedView uses insta
 | `src/ndi_io.*` | `SourceFinder` (discovery thread) and `Receiver` (capture thread). Video is requested as BGRA so NDI does the YUV→RGB conversion with the correct BT.601/709 matrix and every renderer can upload it directly |
 | `src/main.cpp` | SDL3 window/renderer/audio, the ImGui overlay, fullscreen, settings and CLI. Audio goes through an SDL audio stream that resamples any source rate; a small controller nudges the playback rate (±0.5 % max) to cancel clock drift between sender and sound card |
 | `src/display_manager.*` | Which screen FeedView is on and how it reacts to display changes. Pure logic with no SDL, covered by `tests/display_manager_test.cpp`, which replays unplug/replug/rearrange/resolution/identical-monitor scenarios against a simulated OS (`ctest`) |
+| `src/remote_server.*` | The web remote's HTTP server ([cpp-httplib](https://github.com/yhirose/cpp-httplib)): auth, rate limiting, cross-site and DNS-rebinding protection. Commands are queued and run on the UI thread, which publishes state and preview frames, so phones never stall the picture. Covered by `tests/remote_server_test.cpp` |
+| `src/remote_view.*`, `web/index.html` | The state JSON, preview downscaling, and the control page (embedded into the binary at build time) |
 | `src/settings.*` | `settings.ini` in the per-user app data folder |
 | `tools/test_sender.cpp` | The test-pattern sender |
 

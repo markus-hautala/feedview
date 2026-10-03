@@ -63,7 +63,7 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release --parallel
-      - name: Display-handling tests
+      - name: Tests (display handling, web remote server)
         run: ctest --test-dir build -C Release --output-on-failure
 
       # ---- Package
@@ -115,6 +115,24 @@ jobs:
           echo "Sources: $out"
           echo "$out" | grep -F "(CI Test)" > /dev/null || echo "::warning::Test source not discovered on this runner"
           kill %1 2>/dev/null || true
+
+      # The packaged app starts, serves the web remote page and answers with its state.
+      - name: Web remote smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb
+          dir=dist/FeedView-linux-x86_64
+          export SDL_AUDIO_DRIVER=dummy XDG_DATA_HOME="$RUNNER_TEMP/fv"
+          xvfb-run -a "$dir/FeedView" --remote-port 18080 &
+          for _ in $(seq 1 30); do curl -fs http://127.0.0.1:18080/api/ping && break; sleep 1; done
+          echo
+          curl -fsS http://127.0.0.1:18080/ | grep "FeedView remote" > /dev/null
+          sleep 2  # settings (with the generated PIN) are written within a second
+          pin=$(grep '^remote_pin=' "$XDG_DATA_HOME/FeedView/FeedView/settings.ini" | cut -d= -f2)
+          curl -fsS -H "X-FeedView-Pin: $pin" http://127.0.0.1:18080/api/state | grep '"displays"' > /dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/api/fullscreen)
+          [ "$code" = 401 ] || { echo "expected 401 without PIN, got $code"; exit 1; }
+          kill %1
 
       # Uploaded as-is (no zip-in-zip); the file name becomes the artifact name.
       - uses: actions/upload-artifact@v7

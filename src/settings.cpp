@@ -51,12 +51,20 @@ bool Settings::load(const std::string& path) {
         else if (key == "display_nth") displayNth = toInt(val, 0);
         else if (key == "start_fullscreen") startFullscreen = toInt(val, 0) != 0;
         else if (key == "show_info") showInfo = toInt(val, 0) != 0;
+        else if (key == "clean_output") cleanOutput = toInt(val, 0) != 0;
+        else if (key == "remote_enabled") remoteEnabled = toInt(val, 1) != 0;
+        else if (key == "remote_port") remotePort = toInt(val, 8080);
+        else if (key == "remote_pin") remotePin = trim(val);
+        else if (key == "remote_require_pin") remoteRequirePin = toInt(val, 1) != 0;
     }
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
     if (audioPair < 0 || audioPair % 2) audioPair = 0;
     if (displayIndex < -1) displayIndex = -1;
     if (displayNth < 0) displayNth = 0;
+    if (remotePort < 1 || remotePort > 65535) remotePort = 8080;
+    if (remotePin.size() < 4 || remotePin.size() > 8 || remotePin.find_first_not_of("0123456789") != std::string::npos)
+        remotePin.clear();
     return true;
 }
 
@@ -72,7 +80,12 @@ bool Settings::save(const std::string& path) const {
         << "display_name=" << displayName << "\n"
         << "display_nth=" << displayNth << "\n"
         << "start_fullscreen=" << (startFullscreen ? 1 : 0) << "\n"
-        << "show_info=" << (showInfo ? 1 : 0) << "\n";
+        << "show_info=" << (showInfo ? 1 : 0) << "\n"
+        << "clean_output=" << (cleanOutput ? 1 : 0) << "\n"
+        << "remote_enabled=" << (remoteEnabled ? 1 : 0) << "\n"
+        << "remote_port=" << remotePort << "\n"
+        << "remote_pin=" << remotePin << "\n"
+        << "remote_require_pin=" << (remoteRequirePin ? 1 : 0) << "\n";
     const std::string text = out.str();
 
     // Write a temp file first so a crash never leaves a half-written settings file.

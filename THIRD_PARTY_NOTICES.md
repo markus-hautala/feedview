@@ -8,7 +8,10 @@ FeedView is built with the following components.
 | NDI SDK headers (`third_party/ndi/include`) | Compile-time API definitions | MIT (notice in each header), © Vizrt NDI AB |
 | [SDL 3](https://github.com/libsdl-org/SDL) | Window, rendering, audio, input | zlib |
 | [Dear ImGui](https://github.com/ocornut/imgui) | On-screen controls | MIT |
-| Roboto Medium font (shipped with Dear ImGui) | UI text | Apache 2.0 |
+| Roboto Medium font (shipped with Dear ImGui) | UI text, web remote labels | Apache 2.0 |
+| [cpp-httplib](https://github.com/yhirose/cpp-httplib) | Web remote HTTP server | MIT |
+| [QR Code generator](https://github.com/nayuki/QR-Code-generator) (Project Nayuki) | QR code for the remote's address | MIT |
+| [stb_image_write](https://github.com/nothings/stb) | JPEG encoding of the remote preview | MIT / public domain |
 
 NDI® is a registered trademark of Vizrt NDI AB. FeedView is an independent application
 that is compatible with NDI; it is not a product of, affiliated with, or endorsed by

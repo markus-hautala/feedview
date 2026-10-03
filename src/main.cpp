@@ -13,15 +13,22 @@
 #include "display_manager.h"
 #include "ndi_io.h"
 #include "ndi_runtime.h"
+#include "net_info.h"
+#include "qrcodegen.hpp"
+#include "remote_server.h"
+#include "remote_view.h"
 #include "settings.h"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,6 +44,8 @@
 
 extern const unsigned char kUiFontData[];
 extern const unsigned int kUiFontDataSize;
+extern const unsigned char kWebPage[];
+extern const unsigned int kWebPageSize;
 
 namespace {
 
@@ -63,6 +72,8 @@ struct Options {
     double listSeconds = 3.0;
     bool help = false;
     bool version = false;
+    int remotePort = -1;
+    bool noRemote = false;
     std::string error;
 };
 
@@ -76,6 +87,8 @@ const char* kUsage =
     "  --volume N          Volume 0-100\n"
     "  --mute              Start muted\n"
     "  --list-sources[=S]  Print the sources found within S seconds (default 3) and exit\n"
+    "  --remote-port N     Port for the web remote (default 8080, next free one if taken)\n"
+    "  --no-remote         Turn the web remote off for this run\n"
     "  --version           Print version and exit\n"
     "  --help              Show this help\n"
     "\n"
@@ -114,6 +127,10 @@ Options parseArgs(int argc, char** argv) {
             o.display = std::max(1, std::atoi(v.c_str())) - 1;
         } else if (value(i, a, "--volume", v)) {
             o.volume = std::clamp(std::atoi(v.c_str()), 0, 100);
+        } else if (value(i, a, "--remote-port", v)) {
+            o.remotePort = std::clamp(std::atoi(v.c_str()), 1, 65535);
+        } else if (a == "--no-remote") {
+            o.noRemote = true;
         } else if (a == "--fullscreen" || a == "-f") {
             o.fullscreen = true;
         } else if (a == "--mute") {
@@ -556,6 +573,45 @@ void drawToasts(std::vector<Toast>& toasts, Uint64 now, ImVec2 view, float top, 
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// QR code for the web remote's address (drawn with ImGui; white quiet zone around it)
+
+void drawQrCode(const std::string& text, float size) {
+    try {
+        const auto qr = qrcodegen::QrCode::encodeText(text.c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
+        const int n = qr.getSize(), quiet = 2;
+        const float cell = std::max(1.0f, std::floor(size / float(n + 2 * quiet)));
+        const float total = cell * float(n + 2 * quiet);
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + total, p.y + total), IM_COL32(255, 255, 255, 255));
+        for (int y = 0; y < n; ++y)
+            for (int x = 0; x < n; ++x)
+                if (qr.getModule(x, y)) {
+                    const ImVec2 a(p.x + (x + quiet) * cell, p.y + (y + quiet) * cell);
+                    dl->AddRectFilled(a, ImVec2(a.x + cell, a.y + cell), IM_COL32(0, 0, 0, 255));
+                }
+        ImGui::Dummy(ImVec2(total, total));
+    } catch (...) {
+        ImGui::TextDisabled("(address too long for a QR code)");
+    }
+}
+
+// "1", "true", "on" / "0", "false", "off" / "toggle" (or missing) -> new value.
+std::optional<bool> parseSwitch(const RemoteCommand& c, const char* key, bool current) {
+    const std::string v = c.param(key, "toggle");
+    if (v == "1" || v == "true" || v == "on" || v == "yes") return true;
+    if (v == "0" || v == "false" || v == "off" || v == "no") return false;
+    if (v == "toggle") return !current;
+    return std::nullopt;
+}
+
+int64_t unixMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 int listSourcesAndExit(NdiRuntime& runtime, const Options& opt, const Settings& settings) {
     if (!runtime.loaded()) {
         std::fprintf(stderr, "NDI runtime not found. %s\nDownload: %s\n", runtime.error().c_str(),
@@ -612,6 +668,7 @@ int main(int argc, char** argv) {
     if (opt.extraIpsSet) settings.extraIps = opt.extraIps;
     if (opt.volume >= 0) settings.volume = opt.volume;
     if (opt.mute) settings.muted = true;
+    if (settings.remotePin.empty()) settings.remotePin = RemoteServer::generatePin();
 
     // ---- NDI runtime
     const char* base = SDL_GetBasePath();
@@ -704,10 +761,21 @@ int main(int argc, char** argv) {
 
     // ---- Displays / fullscreen (see display_manager.h for the behaviour)
     std::vector<Toast> toasts;
+    std::deque<RemoteNotice> notices;  // shown in the web remote
+    uint64_t nextNoticeId = 1;
+    // True while handling the operator's own keyboard/mouse input. Messages caused by
+    // anything else (display changes, the web remote) are not drawn over the fullscreen
+    // picture - the audience would see them - but they are always listed in the web remote.
+    bool localAction = false;
     auto notify = [&](const std::string& m) {
         SDL_Log("%s", m.c_str());
-        toasts.push_back({m, SDL_GetTicks() + 6000});
-        if (toasts.size() > 3) toasts.erase(toasts.begin());
+        notices.push_back({nextNoticeId++, unixMillis(), m});
+        if (notices.size() > 30) notices.pop_front();
+        const bool fullscreenNow = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+        if (localAction || !fullscreenNow) {
+            toasts.push_back({m, SDL_GetTicks() + 6000});
+            if (toasts.size() > 3) toasts.erase(toasts.begin());
+        }
     };
     SdlDisplayPlatform platform(window, notify);
     DisplayManager dm(platform);
@@ -741,14 +809,204 @@ int main(int argc, char** argv) {
     applyUiStyle(uiScale);
     bool rescaleUi = false;
 
+    // ---- Web remote (see remote_server.h)
+    const std::string hostName = localHostName();
+    const Uint64 startTicks = SDL_GetTicks();
+    RemoteServer remote;
+    remote.setPage(std::string(reinterpret_cast<const char*>(kWebPage), kWebPageSize));
+    remote.setFont(kUiFontData, kUiFontDataSize);
+    remote.setIdentity(hostName, FEEDVIEW_VERSION);
+    remote.setActions({"fullscreen", "display", "identify", "source", "reconnect", "volume", "mute", "audio-pair",
+                       "settings"});
+    std::string remoteError;
+    std::vector<std::string> localAddresses = localIPv4Addresses();
+    Uint64 lastAddressRefresh = SDL_GetTicks();
+    auto applyRemoteSettings = [&]() {
+        remote.setAuth(settings.remotePin, settings.remoteRequirePin);
+        const bool want = settings.remoteEnabled && !opt.noRemote;
+        if (want && !remote.running()) {
+            const int port = opt.remotePort > 0 ? opt.remotePort : settings.remotePort;
+            if (remote.start(port) == 0) {
+                remoteError = "Ports " + std::to_string(port) + "-" + std::to_string(port + 9) +
+                              " are all in use by other programs. Pick another port with --remote-port.";
+                SDL_Log("%s", remoteError.c_str());
+            } else {
+                remoteError.clear();
+                SDL_Log("Web remote on port %d", remote.port());
+            }
+        } else if (!want && remote.running()) {
+            remote.stop();
+        }
+    };
+    applyRemoteSettings();
+    auto remoteUrls = [&]() {
+        std::vector<std::string> urls;
+        if (!remote.running()) return urls;
+        const std::string port = ":" + std::to_string(remote.port());
+        for (const auto& a : localAddresses) urls.push_back("http://" + a + port);
+        urls.push_back("http://" + hostName + ".local" + port);
+        return urls;
+    };
+    // Latest values from the frame loop, for the web remote (also valid while minimized).
+    ReceiverStatus lastStatus;
+    bool lastHasPicture = false, lastSignalLost = false;
+
+    auto remoteState = [&]() {
+        RemoteSnapshot r;
+        r.host = hostName;
+        r.version = FEEDVIEW_VERSION;
+        r.runtimeLoaded = runtime.loaded();
+        r.runtimeVersion = runtime.versionString();
+        r.uptimeSeconds = double(SDL_GetTicks() - startTicks) / 1000.0;
+        r.source = receiver ? receiver->source() : settings.source;
+        for (const auto& src : sources) {
+            r.sources.push_back(src.name);
+            if (src.name == r.source) r.sourceListed = true;
+        }
+        r.status = lastStatus;
+        r.hasPicture = lastHasPicture;
+        r.signalLost = lastSignalLost;
+        r.frameSerial = frame.serial;
+        r.volume = settings.volume;
+        r.muted = settings.muted;
+        r.audioPair = settings.audioPair;
+        r.haveAudioDevice = haveAudio;
+        r.bufferMs = audio.bufferMs();
+        const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+        for (const auto& d : dm.displays()) {
+            RemoteDisplay rd;
+            rd.name = d.name;
+            rd.x = d.bounds.x;
+            rd.y = d.bounds.y;
+            rd.w = d.bounds.w;
+            rd.h = d.bounds.h;
+            if (const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(d.id)) rd.refreshHz = m->refresh_rate;
+            rd.scale = SDL_GetDisplayContentScale(d.id);
+            rd.primary = d.id == primary;
+            r.displays.push_back(rd);
+        }
+        r.targetIndex = dm.targetIndex();
+        r.targetName = dm.target().name;
+        r.targetLabel = dm.targetLabel();
+        r.wantFullscreen = dm.wantFullscreen();
+        r.fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+        r.waiting = dm.waitingForTarget();
+        r.identify = identify.active();
+        SDL_GetWindowPosition(window, &r.windowX, &r.windowY);
+        SDL_GetWindowSize(window, &r.windowW, &r.windowH);
+        const SDL_DisplayID wd = SDL_GetDisplayForWindow(window);
+        for (int i = 0; i < int(dm.displays().size()); ++i)
+            if (dm.displays()[i].id == wd) r.windowDisplay = i;
+        r.startFullscreen = settings.startFullscreen;
+        r.showInfo = settings.showInfo;
+        r.cleanOutput = settings.cleanOutput;
+        r.extraIps = settings.extraIps;
+        r.pinRequired = settings.remoteRequirePin;
+        r.urls = remoteUrls();
+        r.clients = remote.recentClients(15);
+        r.notices.assign(notices.begin(), notices.end());
+        return remoteStateJson(r);
+    };
+
+    char extraIpsBuf[512] = {};
+    SDL_strlcpy(extraIpsBuf, settings.extraIps.c_str(), sizeof extraIpsBuf);
+
+    // Runs one web-remote command on this (the UI) thread.
+    auto handleRemote = [&](const RemoteCommand& c) -> RemoteResult {
+        const Uint64 t = SDL_GetTicks();
+        const std::string& a = c.action;
+        if (a == "fullscreen") {
+            auto on = parseSwitch(c, "on", dm.wantFullscreen() && !dm.waitingForTarget());
+            if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
+            dm.setFullscreen(*on, t);
+            return {true, *on ? "Fullscreen on " + dm.targetLabel() : "Fullscreen off"};
+        }
+        if (a == "display") {
+            const int n = std::atoi(c.param("number").c_str());
+            const int count = int(dm.displays().size());
+            if (n < 1 || n > count)
+                return RemoteResult::fail("There is no display " + c.param("number") + " (1-" + std::to_string(count) + ")");
+            const bool fs = parseSwitch(c, "fullscreen", true).value_or(true);
+            identify.hide();
+            dm.chooseDisplay(n - 1, fs, t);
+            return {true, (fs ? "Fullscreen on " : "Moved to ") + dm.label(n - 1)};
+        }
+        if (a == "identify") {
+            auto on = parseSwitch(c, "on", identify.active());
+            if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
+            if (*on == identify.active()) return {true, *on ? "Display numbers are showing" : "Display numbers hidden"};
+            if (*on && int(dm.displays().size()) < FEEDVIEW_IDENTIFY_MIN_DISPLAYS)
+                return RemoteResult::fail("Only one display is connected", 409);
+            toggleIdentify();
+            return {true, *on ? "Showing display numbers on all screens" : "Display numbers hidden"};
+        }
+        if (a == "source") {
+            if (!c.has("name")) return RemoteResult::fail("name is missing (empty name = no source)");
+            if (!receiver) return RemoteResult::fail("The NDI runtime is not loaded", 409);
+            const std::string name = c.param("name");
+            selectSource(name);
+            return {true, name.empty() ? std::string("No source") : "Showing " + name};
+        }
+        if (a == "reconnect") {
+            if (!receiver || receiver->source().empty()) return RemoteResult::fail("No source selected", 409);
+            const std::string name = receiver->source();
+            selectSource(name);
+            return {true, "Reconnecting to " + name};
+        }
+        if (a == "volume") {
+            const std::string v = c.param("value");
+            if (v.empty() || v.find_first_not_of("+-0123456789") != std::string::npos)
+                return RemoteResult::fail("value must be 0-100, or +N / -N to step");
+            const int n = std::atoi(v.c_str());
+            settings.volume = std::clamp((v[0] == '+' || v[0] == '-') ? settings.volume + n : n, 0, 100);
+            return {true, "Volume " + std::to_string(settings.volume) + "%"};
+        }
+        if (a == "mute") {
+            auto on = parseSwitch(c, "on", settings.muted);
+            if (!on) return RemoteResult::fail("on must be 1, 0 or toggle");
+            settings.muted = *on;
+            return {true, *on ? "Muted" : "Unmuted"};
+        }
+        if (a == "audio-pair") {
+            const int first = std::atoi(c.param("first").c_str());  // 1, 3, 5 ...
+            if (first < 1 || first > 15 || first % 2 == 0)
+                return RemoteResult::fail("first must be an odd channel number: 1, 3, 5 ...");
+            settings.audioPair = first - 1;
+            return {true, "Audio channels " + std::to_string(first) + "-" + std::to_string(first + 1)};
+        }
+        if (a == "settings") {
+            for (const char* k : {"start_fullscreen", "show_info", "clean_output"}) {
+                if (!c.has(k)) continue;
+                bool* field = std::string(k) == "start_fullscreen" ? &settings.startFullscreen
+                              : std::string(k) == "show_info"      ? &settings.showInfo
+                                                                   : &settings.cleanOutput;
+                auto v = parseSwitch(c, k, *field);
+                if (!v) return RemoteResult::fail(std::string(k) + " must be 1, 0 or toggle");
+                *field = *v;
+            }
+            if (c.has("extra_ips")) {
+                const std::string ips = c.param("extra_ips");
+                if (ips.size() >= sizeof extraIpsBuf) return RemoteResult::fail("extra_ips is too long");
+                if (ips != settings.extraIps) {
+                    settings.extraIps = ips;
+                    SDL_strlcpy(extraIpsBuf, ips.c_str(), sizeof extraIpsBuf);
+                    if (finder) finder->start(settings.extraIps);
+                }
+            }
+            return {true, "Settings saved"};
+        }
+        return RemoteResult::fail("Unknown command", 404);
+    };
+    Uint64 lastStatePublish = 0, lastPreviewTicks = 0;
+    uint64_t lastPreviewSerial = 0;
+    bool previewPublished = false;
+
     // ---- Main loop
     bool running = true;
     Uint64 lastActivity = SDL_GetTicks();
     Uint64 lastSaveCheck = 0;
     Uint64 lastFrameTicks = SDL_GetTicksNS();
     bool cursorVisible = true;
-    char extraIpsBuf[512] = {};
-    SDL_strlcpy(extraIpsBuf, settings.extraIps.c_str(), sizeof extraIpsBuf);
 
     while (running) {
         if (finder) sources = finder->sources();
@@ -766,6 +1024,8 @@ int main(int argc, char** argv) {
         }
 
         SDL_Event e;
+        bool closePopups = false;
+        localAction = true;  // notices from here on are answers to the operator's own input
         while (SDL_PollEvent(&e)) {
             ImGui_ImplSDL3_ProcessEvent(&e);
             switch (e.type) {
@@ -843,7 +1103,10 @@ int main(int argc, char** argv) {
                     } else if (k == SDLK_F || k == SDLK_F11) {
                         dm.toggleFullscreen(t);
                     } else if (k == SDLK_ESCAPE) {
-                        if (identify.active()) identify.hide();
+                        // Esc closes whatever is open first, and only then leaves fullscreen.
+                        if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+                            closePopups = true;
+                        else if (identify.active()) identify.hide();
                         else if (dm.wantFullscreen()) dm.setFullscreen(false, t);
                     } else if (k == SDLK_M) {
                         settings.muted = !settings.muted;
@@ -861,6 +1124,7 @@ int main(int argc, char** argv) {
                     break;
             }
         }
+        localAction = false;
         if (!running) break;
 
         // ---- Keep the window on the right screen; follow DPI when it moves between monitors
@@ -879,6 +1143,37 @@ int main(int argc, char** argv) {
                 if (std::fabs(s - uiScale) > 0.01f) {
                     uiScale = s;
                     applyUiStyle(uiScale);
+                }
+            }
+        }
+
+        // ---- Web remote: run queued commands, publish state and preview frames
+        {
+            const Uint64 t = SDL_GetTicks();
+            if (t - lastAddressRefresh > 5000) {  // the network can change during a show
+                localAddresses = localIPv4Addresses();
+                lastAddressRefresh = t;
+            }
+            if (remote.running()) {
+                const int handled = remote.processCommands(handleRemote, remoteState);
+                if (handled) {
+                    lastStatePublish = t;
+                } else if (t - lastStatePublish >= 250) {
+                    remote.publishState(remoteState());
+                    lastStatePublish = t;
+                }
+                if (!lastHasPicture) {
+                    if (previewPublished) remote.clearPreview();
+                    previewPublished = false;
+                } else if (remote.previewWanted() && frame.serial != lastPreviewSerial && t - lastPreviewTicks >= 200) {
+                    int pw = 0, ph = 0;
+                    std::vector<uint8_t> rgb = makePreview(frame, 640, pw, ph);
+                    if (!rgb.empty()) {
+                        remote.publishPreview(std::move(rgb), pw, ph, frame.serial);
+                        previewPublished = true;
+                    }
+                    lastPreviewSerial = frame.serial;
+                    lastPreviewTicks = t;
                 }
             }
         }
@@ -907,6 +1202,9 @@ int main(int argc, char** argv) {
         const bool hasPicture = texture && frame.serial != 0;
         // A picture with no fresh frames (or kept across a reconnect) is flagged, never shown as live.
         const bool signalLost = hasPicture && (st.secondsSinceVideo > 1.0 || st.secondsSinceVideo < 0);
+        lastStatus = st;
+        lastHasPicture = hasPicture;
+        lastSignalLost = signalLost;
 
         audio.setGain(volumeToGain(settings.volume, settings.muted));
         if (receiver && receiver->audioPair() != settings.audioPair) receiver->setAudioPair(settings.audioPair);
@@ -915,11 +1213,19 @@ int main(int argc, char** argv) {
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        localAction = true;  // clicks in the UI are the operator's own actions
 
         const Uint64 now = SDL_GetTicks();
         const bool popupOpen = ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
-        const bool showOverlay = !runtime.loaded() || !hasPicture || signalLost || popupOpen || identify.active() ||
-                                 io.WantCaptureMouse || (now - lastActivity) < Uint64(kOverlayHideSeconds * 1000);
+        // The operator is using FeedView's own controls right now.
+        const bool localInteraction = popupOpen || identify.active() || io.WantCaptureMouse ||
+                                      (now - lastActivity) < Uint64(kOverlayHideSeconds * 1000);
+        // Clean output: nothing of FeedView's own is drawn over the fullscreen picture unless
+        // the operator is using the controls; status is in the web remote instead.
+        const bool quietOutput =
+            settings.cleanOutput && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) && !localInteraction;
+        const bool showOverlay =
+            localInteraction || !runtime.loaded() || (!quietOutput && (!hasPicture || signalLost));
         const ImVec2 view = io.DisplaySize;
         ImDrawList* bg = ImGui::GetBackgroundDrawList();
         float barHeight = 0.0f;
@@ -959,11 +1265,19 @@ int main(int argc, char** argv) {
         } else {
             // Centre messages
             const ImVec2 center(view.x * 0.5f, view.y * 0.5f);
-            if (receiver && receiver->source().empty()) {
+            if (quietOutput) {
+                // black, by request
+            } else if (receiver && receiver->source().empty()) {
                 centeredText(bg, center, "Select an NDI source", 1.6f, IM_COL32(230, 230, 230, 255));
                 centeredText(bg, ImVec2(center.x, center.y + ImGui::GetFontSize() * 2.0f),
                              sources.empty() ? "Searching the network..." : "Use the Source menu above, or press 1-9",
                              1.0f, IM_COL32(150, 150, 150, 255));
+                const auto urls = remoteUrls();
+                if (!urls.empty()) {
+                    const std::string line = "Web remote: " + urls.front();
+                    centeredText(bg, ImVec2(center.x, view.y - ImGui::GetFontSize() * 2.0f), line.c_str(), 1.0f,
+                                 IM_COL32(120, 120, 120, 255));
+                }
             } else if (!hasPicture) {
                 std::string msg = st.connected ? "Waiting for video from " : "Connecting to ";
                 msg += receiver->source();
@@ -986,6 +1300,7 @@ int main(int argc, char** argv) {
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(std::clamp(view.x * 0.38f, 180.0f * uiScale, 440.0f * uiScale));
                 if (ImGui::BeginCombo("##source", cur.empty() ? "None" : cur.c_str(), ImGuiComboFlags_HeightLarge)) {
+                    if (closePopups) ImGui::CloseCurrentPopup();
                     if (ImGui::Selectable("    None", cur.empty())) selectSource("");
                     for (size_t i = 0; i < sources.size(); ++i) {
                         char label[600];
@@ -1015,6 +1330,7 @@ int main(int argc, char** argv) {
                 const int chans = st.audioChannels;
                 ImGui::SetNextItemWidth(92.0f * uiScale);
                 if (ImGui::BeginCombo("##pair", pairLabel(settings.audioPair, chans).c_str())) {
+                    if (closePopups) ImGui::CloseCurrentPopup();
                     int pairs = std::max(1, (chans + 1) / 2);
                     for (int p = 0; p < pairs; ++p) {
                         if (ImGui::Selectable(pairLabel(p * 2, chans).c_str(), settings.audioPair == p * 2))
@@ -1041,6 +1357,7 @@ int main(int argc, char** argv) {
                     ImGui::SameLine();
                     ImGui::SetNextItemWidth(230.0f * uiScale);
                     if (ImGui::BeginCombo("##display", dm.targetLabel().c_str(), ImGuiComboFlags_HeightLarge)) {
+                    if (closePopups) ImGui::CloseCurrentPopup();
                         for (int i = 0; i < int(screens.size()); ++i)
                             if (ImGui::Selectable(dm.label(i).c_str(), i == ti)) dm.chooseDisplay(i, false, now);
                         if (ti < 0 && !dm.target().name.empty()) {
@@ -1059,6 +1376,7 @@ int main(int argc, char** argv) {
                 ImGui::SameLine();
                 if (ImGui::Button("Settings")) ImGui::OpenPopup("settings");
                 if (ImGui::BeginPopup("settings")) {
+                    if (closePopups) ImGui::CloseCurrentPopup();
                     ImGui::TextUnformatted("Extra discovery IPs");
                     ImGui::TextDisabled("For sources on other subnets/VLANs, e.g. 10.0.1.20,10.0.2.0");
                     ImGui::SetNextItemWidth(300.0f * uiScale);
@@ -1073,6 +1391,9 @@ int main(int argc, char** argv) {
                     ImGui::Separator();
                     ImGui::Checkbox("Start in fullscreen", &settings.startFullscreen);
                     ImGui::Checkbox("Always show info (I)", &settings.showInfo);
+                    ImGui::Checkbox("Clean output", &settings.cleanOutput);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("no messages over the fullscreen picture");
                     ImGui::Separator();
                     ImGui::TextDisabled("Keys: F fullscreen, Esc leave, 1-9 source, 0 none,");
                     ImGui::TextDisabled("D identify displays, Ctrl+1-9 fullscreen on display N,");
@@ -1083,12 +1404,80 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("NDI(R) is a registered trademark of Vizrt NDI AB.");
                     ImGui::EndPopup();
                 }
+                ImGui::SameLine();
+                const auto clients = remote.recentClients(15);
+                if (ImGui::Button(clients.empty() ? "Remote" : "Remote (in use)")) {
+                    localAddresses = localIPv4Addresses();
+                    ImGui::OpenPopup("remote");
+                }
+                if (ImGui::BeginPopup("remote")) {
+                    if (closePopups) ImGui::CloseCurrentPopup();
+                    ImGui::PushFont(nullptr, style.FontSizeBase * 1.25f);
+                    ImGui::TextUnformatted("Web remote");
+                    ImGui::PopFont();
+                    const auto urls = remoteUrls();
+                    if (!remote.running()) {
+                        ImGui::TextDisabled("%s", remoteError.empty() ? "The web remote is off." : remoteError.c_str());
+                    } else if (localAddresses.empty()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                           "This computer has no network connection right now.");
+                    } else {
+                        const std::string qrText =
+                            urls.front() + (settings.remoteRequirePin ? "/#pin=" + settings.remotePin : "/");
+                        drawQrCode(qrText, 190.0f * uiScale);
+                        ImGui::SameLine();
+                        ImGui::BeginGroup();
+                        ImGui::TextUnformatted("Scan the code, or open this on a phone or");
+                        ImGui::TextUnformatted("computer on the same network:");
+                        ImGui::Spacing();
+                        for (const auto& u : urls) ImGui::TextUnformatted(u.c_str());
+                        if (settings.remoteRequirePin) {
+                            ImGui::Spacing();
+                            ImGui::AlignTextToFramePadding();
+                            ImGui::TextUnformatted("PIN");
+                            ImGui::SameLine();
+                            ImGui::PushFont(nullptr, style.FontSizeBase * 1.6f);
+                            ImGui::TextUnformatted(settings.remotePin.c_str());
+                            ImGui::PopFont();
+                        }
+                        ImGui::Spacing();
+                        if (clients.empty()) {
+                            ImGui::TextDisabled("Nobody is using it right now.");
+                        } else {
+                            std::string who;
+                            for (const auto& c : clients) who += (who.empty() ? "" : ", ") + c;
+                            ImGui::Text("In use from %s", who.c_str());
+                        }
+                        ImGui::EndGroup();
+                    }
+                    ImGui::Separator();
+                    bool enabled = settings.remoteEnabled;
+                    if (ImGui::Checkbox("Web remote on", &enabled)) {
+                        settings.remoteEnabled = enabled;
+                        applyRemoteSettings();
+                    }
+                    ImGui::SameLine();
+                    bool requirePin = settings.remoteRequirePin;
+                    if (ImGui::Checkbox("Require PIN", &requirePin)) {
+                        settings.remoteRequirePin = requirePin;
+                        applyRemoteSettings();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("New PIN")) {
+                        settings.remotePin = RemoteServer::generatePin();
+                        applyRemoteSettings();
+                    }
+                    if (opt.noRemote) ImGui::TextDisabled("Turned off with --no-remote for this run.");
+                    if (!settings.remoteRequirePin)
+                        ImGui::TextDisabled("Without a PIN anyone on this network can control FeedView.");
+                    ImGui::EndPopup();
+                }
                 barHeight = ImGui::GetWindowHeight();
                 ImGui::End();
             }
 
             // ---- Info / status line
-            if ((showOverlay || settings.showInfo) && receiver && !receiver->source().empty()) {
+            if ((showOverlay || (settings.showInfo && !quietOutput)) && receiver && !receiver->source().empty()) {
                 char info[512];
                 std::string fmt = formatRate(st.frameRateN, st.frameRateD);
                 int n = 0;
@@ -1122,7 +1511,7 @@ int main(int argc, char** argv) {
                 ImGui::End();
             }
 
-            if (signalLost) {
+            if (signalLost && !quietOutput) {
                 std::string msg = (st.connected ? "No video from " : "Source offline: ") + receiver->source();
                 centeredText(ImGui::GetForegroundDrawList(), ImVec2(view.x * 0.5f, view.y * 0.5f), msg.c_str(), 1.3f,
                              IM_COL32(255, 90, 80, 255));
@@ -1139,7 +1528,8 @@ int main(int argc, char** argv) {
                 dm.chooseDisplay(si, true, now);
             }
         }
-        drawToasts(toasts, now, view, barHeight + 10.0f * uiScale, uiScale);
+        if (!quietOutput) drawToasts(toasts, now, view, barHeight + 10.0f * uiScale, uiScale);
+        localAction = false;
 
         // Hide the mouse pointer together with the overlay.
         const bool wantCursor = showOverlay || !runtime.loaded();
@@ -1165,7 +1555,7 @@ int main(int argc, char** argv) {
             }
             SDL_FRect dst{std::floor((ow - w) * 0.5f), std::floor((oh - h) * 0.5f), std::round(w), std::round(h)};
             SDL_RenderTexture(renderer, texture, nullptr, &dst);
-            if (signalLost) {
+            if (signalLost && !quietOutput) {
                 SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
                 SDL_SetRenderDrawColor(renderer, 0, 0, 0, 170);
                 SDL_RenderFillRect(renderer, &dst);
@@ -1190,6 +1580,7 @@ int main(int argc, char** argv) {
 
     if (!(settings == saved) && !settingsPath.empty()) settings.save(settingsPath);
 
+    remote.stop();
     identify.hide();
     receiver.reset();
     finder.reset();

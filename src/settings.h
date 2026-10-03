@@ -15,6 +15,13 @@ struct Settings {
     int displayIndex = -1;   // display number (0-based) when picked; fallback if name is empty
     bool startFullscreen = false;
     bool showInfo = false;
+    // Hide FeedView's own messages on the fullscreen output (status stays in the web remote).
+    bool cleanOutput = false;
+    // Web remote
+    bool remoteEnabled = true;
+    int remotePort = 8080;
+    std::string remotePin;  // generated on first start
+    bool remoteRequirePin = true;
 
     bool load(const std::string& path);
     bool save(const std::string& path) const;
