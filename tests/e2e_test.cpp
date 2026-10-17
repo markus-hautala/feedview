@@ -26,6 +26,7 @@
 #include "os_control.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -220,13 +221,17 @@ std::vector<Rgb8> sampleAfter(POINT p, int ms, const std::function<void()>& acti
     return out;
 }
 
-// Centre on the screen of a control FeedView reports in output.ui (it does when started with
-// FEEDVIEW_TEST_UI), from the state JSON; {-1,-1} if it isn't drawn right now.
+// Where on the screen a control FeedView reports in output.ui is (it does when started with
+// FEEDVIEW_TEST_UI), from the state JSON; empty / kNotDrawn if it isn't drawn right now.
+// (Screen coordinates are negative on a monitor left of or above the main one.)
+constexpr POINT kNotDrawn{LONG_MIN, LONG_MIN};
+bool drawn(POINT p) { return p.x != kNotDrawn.x; }
+
 RECT controlRect(HWND fv, const std::string& state, const std::string& name) {
     const size_t at = state.find("\"" + name + "\":[");
-    if (at == std::string::npos) return {-1, -1, -1, -1};
+    if (at == std::string::npos) return {};
     int x = 0, y = 0, w = 0, h = 0;
-    if (std::sscanf(state.c_str() + at + name.size() + 4, "%d,%d,%d,%d", &x, &y, &w, &h) != 4) return {-1, -1, -1, -1};
+    if (std::sscanf(state.c_str() + at + name.size() + 4, "%d,%d,%d,%d", &x, &y, &w, &h) != 4) return {};
     POINT a{x, y};
     ClientToScreen(fv, &a);
     return {a.x, a.y, a.x + w, a.y + h};
@@ -234,13 +239,13 @@ RECT controlRect(HWND fv, const std::string& state, const std::string& name) {
 
 POINT controlCenter(HWND fv, const std::string& state, const std::string& name) {
     const RECT r = controlRect(fv, state, name);
-    if (r.left < 0) return {-1, -1};
+    if (r.right <= r.left) return kNotDrawn;
     return {(r.left + r.right) / 2, (r.top + r.bottom) / 2};
 }
 
 // Pure white pixels in a screen rectangle (a QR code has many; a 75 % colour-bar picture none).
 int countWhite(RECT r) {
-    if (r.left < 0 || r.right <= r.left || r.bottom <= r.top) return -1;
+    if (r.right <= r.left || r.bottom <= r.top) return -1;
     int n = 0;
     for (uint32_t p : capture(r))
         if (((p >> 16) & 255) >= 250 && ((p >> 8) & 255) >= 250 && (p & 255) >= 250) ++n;
@@ -275,8 +280,12 @@ struct OtherApp {
         });
         WaitForSingleObject(ready, 5000);
     }
-    void stop() {
+    // `focusTo`: while this window has the keyboard, give it to that window first (as if
+    // clicked). Otherwise Windows hands it to whatever is next, and if that program runs as
+    // administrator, Windows drops this test's simulated mouse and keys from then on.
+    void stop(HWND focusTo = nullptr) {
         if (!t.joinable()) return;
+        if (focusTo && GetForegroundWindow() == hwnd) SetForegroundWindow(focusTo);
         PostThreadMessageW(threadId, WM_QUIT, 0, 0);
         t.join();
     }
@@ -515,12 +524,12 @@ int main(int argc, char** argv) {
         // As a person would: move the mouse until the controls show, click Remote, click the link.
         CHECK(showsAfter(1300) >= 0);
         const POINT remoteButton = controlCenter(fv, state(), "remote_button");
-        CHECK(remoteButton.x >= 0);
+        CHECK(drawn(remoteButton));
         click(remoteButton);
         CHECK(waitFor([&] { return contains(state(), "\"panel\":\"remote\""); }, 3000));
         Sleep(300);
         const POINT link = controlCenter(fv, state(), "remote_link");
-        CHECK(link.x >= 0);
+        CHECK(drawn(link));
         std::printf("  clicking the link at %ld,%ld\n", link.x, link.y);
         click(link);
         std::string opened;
@@ -607,7 +616,7 @@ int main(int argc, char** argv) {
         CHECK(os::coveredByOtherWindow(fv));  // checked at once: FeedView looks twice a second
         Sleep(1500);
         CHECK(windowAt(center) == fv);
-        cover.stop();
+        cover.stop(fv);
         Sleep(1200);
         CHECK(windowAt(center) == fv);
         CHECK(windowAt(taskbar) == fv);  // the taskbar doesn't come back over the output
@@ -616,6 +625,12 @@ int main(int argc, char** argv) {
         SCENARIO("[REQ-03] fullscreen from the web remote also brings back a minimized FeedView");
         CHECK(post("fullscreen", {{"on", "0"}}) == 200);
         CHECK(waitFor([&] { return contains(state(), "\"fullscreen\":false"); }, 3000));
+        // Someone at the computer clicks into another program, then minimizes FeedView. (If
+        // FeedView had the keyboard, Windows would give it to whatever is behind: see OtherApp.)
+        OtherApp desk;
+        desk.start(RECT{mon.left, mon.top, mon.left + 120, mon.top + 120}, 0);
+        click(POINT{mon.left + 60, mon.top + 60});
+        Sleep(300);
         ShowWindow(fv, SW_MINIMIZE);
         CHECK(waitFor([&] { return IsIconic(fv) != 0; }, 3000));
         Sleep(2000);
@@ -625,6 +640,7 @@ int main(int argc, char** argv) {
         CHECK(!IsIconic(fv));
         CHECK(contains(state(), "\"fullscreen\":true"));
         CHECK(windowAt(center) == fv);
+        desk.stop(fv);
     }
     {
         SCENARIO("[REQ-02][REQ-06] 'Always on top' can be switched off and on from the web remote");
@@ -637,6 +653,80 @@ int main(int argc, char** argv) {
         CHECK(os::isTopmost(fv));
         CHECK(contains(state(), "\"onTop\":true"));
         std::printf("  (longest frame gap around the fullscreen changes: %d ms)\n", frameGap());
+    }
+    // As a person would: move the mouse until the controls show, Settings, the checkbox.
+    auto clickOnTopCheckbox = [&] {
+        RECT w{};
+        GetWindowRect(fv, &w);
+        const POINT in{(w.left + w.right) / 2, w.top + (w.bottom - w.top) * 3 / 5};
+        std::thread mover([&] { wiggle(in, 1300); });
+        mover.join();
+        const POINT settingsButton = controlCenter(fv, state(), "settings_button");
+        CHECK(drawn(settingsButton));
+        click(settingsButton);
+        CHECK(waitFor([&] { return contains(state(), "\"panel\":\"settings\""); }, 3000));
+        Sleep(300);
+        const POINT box = controlCenter(fv, state(), "always_on_top");
+        CHECK(drawn(box));
+        std::printf("  clicking 'Always on top' at %ld,%ld\n", box.x, box.y);
+        click(box);
+        Sleep(300);
+        CHECK(post("controls", {{"on", "0"}}) == 200);  // closes the panel again
+        CHECK(waitFor([&] { return contains(state(), "\"controls\":{\"visible\":false,\"panel\":\"\""); }, 3000));
+    };
+    {
+        SCENARIO("[REQ-22] 'Always on top' switched off in FeedView's own Settings: another program can come over it");
+        CHECK(post("fullscreen", {{"on", "0"}}) == 200);
+        CHECK(waitFor([&] { return contains(state(), "\"fullscreen\":false"); }, 3000));
+        Sleep(500);
+        clickOnTopCheckbox();
+        CHECK(waitFor([&] { return contains(state(), "\"alwaysOnTop\":false"); }, 2000));
+        CHECK(!os::isTopmost(fv));
+        CHECK(contains(state(), "\"onTop\":false"));
+        RECT w{};
+        GetWindowRect(fv, &w);
+        const POINT inWindow{(w.left + w.right) / 2, (w.top + w.bottom) / 2};
+        OtherApp cover;  // an ordinary program, not always on top
+        cover.start(mon, 0);
+        Sleep(500);
+        CHECK(windowAt(inWindow) == cover.hwnd);
+        Sleep(1500);
+        CHECK(windowAt(inWindow) == cover.hwnd);  // FeedView doesn't push itself back in front
+
+        SCENARIO("[REQ-22][REQ-03] with it off, fullscreen from the web remote still brings FeedView to the front");
+        CHECK(post("fullscreen", {{"on", "1"}}) == 200);
+        Sleep(1500);
+        std::string s = state();
+        CHECK(contains(s, "\"fullscreen\":true"));
+        CHECK(contains(s, "\"alwaysOnTop\":false"));
+        CHECK(contains(s, "\"onTop\":false"));
+        CHECK(!os::isTopmost(fv));
+        CHECK(windowAt(center) == fv);
+
+        SCENARIO("[REQ-22] ...but the fullscreen output isn't above everything: another program brought forward covers it");
+        SetWindowPos(cover.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        Sleep(300);
+        CHECK(windowAt(center) == cover.hwnd);
+        Sleep(1500);
+        CHECK(windowAt(center) == cover.hwnd);  // and FeedView stays behind it
+        CHECK(!os::isTopmost(fv));
+        cover.stop(fv);
+        Sleep(500);
+        CHECK(windowAt(center) == fv);
+
+        SCENARIO("[REQ-22] switched on again in FeedView's Settings: above everything at once");
+        clickOnTopCheckbox();
+        CHECK(waitFor([&] { return contains(state(), "\"alwaysOnTop\":true"); }, 2000));
+        CHECK(os::isTopmost(fv));
+        s = state();
+        CHECK(contains(s, "\"onTop\":true"));
+        CHECK(contains(s, "\"fullscreen\":true"));
+        OtherApp other;
+        other.start(mon, 0);
+        Sleep(800);
+        CHECK(windowAt(center) == fv);  // an ordinary program opening can't cover it now
+        other.stop(fv);
+        std::printf("  (longest frame gap meanwhile: %d ms)\n", frameGap());
     }
     {
         SCENARIO("[REQ-04] the Remote panel (QR code) opened on the fullscreen output is hidden from the remote");
@@ -776,6 +866,7 @@ int main(int argc, char** argv) {
 
     // ---------------------------------------------------------------- shutdown
     {
+        CHECK(post("settings", {{"always_on_top", "0"}}) == 200);  // for the restart below
         SCENARIO("[REQ-05][REQ-09] FeedView closes cleanly; notifications are back as they were; settings were saved");
         PostMessageW(fv, WM_CLOSE, 0, 0);
         CHECK(app.waitExit(15000));
@@ -784,6 +875,21 @@ int main(int argc, char** argv) {
         CHECK(contains(saved, "settings_version=2"));
         CHECK(contains(saved, "remote_require_pin=0"));
         CHECK(contains(saved, "silenced_notifications=0"));
+        CHECK(contains(saved, "always_on_top=0"));
+    }
+    {
+        SCENARIO("[REQ-22] the choice is remembered: FeedView started again with 'Always on top' off isn't on top");
+        Process again;
+        CHECK(again.start(argv[1], "--settings \"" + settingsPath + "\" --remote-port " + std::to_string(basePort) +
+                                       " --extra-ips 127.0.0.1"));
+        HWND w = nullptr;
+        CHECK(waitFor([&] { return (w = mainWindowOf(again.pi.dwProcessId)) != nullptr; }, 10000));
+        Sleep(1500);
+        CHECK(w && !os::isTopmost(w));
+        if (w) PostMessageW(w, WM_CLOSE, 0, 0);
+        CHECK(again.waitExit(15000));
+        CHECK(contains(readFile(settingsPath), "always_on_top=0"));
+        if (permitted) CHECK(os::notificationPolicyValueForTests() == policy0);
     }
 
     DeleteFileW(wide(settingsPath).c_str());

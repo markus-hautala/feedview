@@ -310,6 +310,17 @@ int main() {
         CHECK(contains(s.serialize(), "settings_version=2"));
     }
     {
+        SCENARIO("[REQ-22] 'Always on top' switched off is remembered through the settings file");
+        Settings s;
+        s.alwaysOnTop = false;
+        CHECK(contains(s.serialize(), "always_on_top=0\n"));
+        Settings back;
+        back.parse(s.serialize());
+        CHECK(!back.alwaysOnTop);
+        back.parse("always_on_top=1\n");
+        CHECK(back.alwaysOnTop);
+    }
+    {
         SCENARIO("[REQ-18] settings: round trip, including the live-production options, through a file; fade is clamped");
         Settings s;
         s.source = "STUDIO (Program)";

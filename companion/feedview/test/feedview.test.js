@@ -201,6 +201,25 @@ test('[REQ-17][REQ-02][REQ-05][REQ-18] settings: each on/off setting toggles and
 	await act('allow_notification_control', {})
 })
 
+test("[REQ-22] 'Always on top': the preset's button takes FeedView off the top and back; feedback and variable follow", { skip }, async () => {
+	const preset = comp.presets.find((p) => p.name === 'Always on top: on / off')
+	assert.ok(preset, 'an Always on top preset')
+	const press = preset.steps[0].down[0]
+	assert.equal(press.actionId, 'setting')
+	assert.equal(preset.feedbacks[0].feedbackId, 'setting')
+	const fb = await comp.subscribe('setting', preset.feedbacks[0].options)
+	await act('setting', { setting: 'always_on_top', on: '1' })
+	await waitFor(async () => (await state()).output.onTop, 3000, 'on top')
+	await act(press.actionId, press.options)
+	const off = await state()
+	assert.equal(off.settings.alwaysOnTop, false)
+	await waitFor(async () => !(await state()).output.onTop, 3000, 'FeedView no longer on top')
+	await comp.waitFor(() => comp.feedbackValues[fb] === false && comp.variables.always_on_top === false, 3000, 'feedback off')
+	await act(press.actionId, press.options)
+	await waitFor(async () => (await state()).output.onTop, 3000, 'FeedView on top again')
+	await comp.waitFor(() => comp.feedbackValues[fb] === true && comp.variables.always_on_top === true, 3000, 'feedback on')
+})
+
 test('[REQ-16] FeedView refuses a bad value: the action fails with its message', { skip }, async () => {
 	const res = await comp.action('display', { display: 99, fullscreen: '1' })
 	assert.equal(res.success, false)

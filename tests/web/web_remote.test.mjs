@@ -245,6 +245,21 @@ test('[REQ-06][REQ-02][REQ-05] every setting checkbox switches its setting (and 
 	}
 })
 
+test("[REQ-22] the page's 'Always on top' checkbox takes FeedView off the top and puts it back", { skip }, async () => {
+	await page.eval(`document.getElementById('settings').open = true`)
+	assert.match(await page.eval(`document.querySelector('label[for=setTop]').textContent`), /Always on top/)
+	if (!(await state()).settings.alwaysOnTop) {
+		await page.click('#setTop')
+		await waitState((s) => s.settings.alwaysOnTop, 3000, 'on to start with')
+	}
+	await page.click('#setTop')
+	await waitState((s) => !s.settings.alwaysOnTop && !s.output.onTop, 3000, 'FeedView no longer on top')
+	assert.equal(await page.eval(`document.getElementById('setTop').checked`), false)
+	await page.click('#setTop')
+	await waitState((s) => s.settings.alwaysOnTop && s.output.onTop, 3000, 'FeedView on top again')
+	assert.equal(await page.eval(`document.getElementById('setTop').checked`), true)
+})
+
 test('[REQ-06] extra discovery IPs are saved from the page', { skip }, async () => {
 	await page.eval(`document.getElementById('setIps').value = '127.0.0.1'`)
 	const m = mark()

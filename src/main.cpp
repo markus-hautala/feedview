@@ -1777,8 +1777,12 @@ int main(int argc, char** argv) {
                     if (ImGui::Checkbox("Always on top", &onTop)) {
                         settings.alwaysOnTop = onTop;
                         onTopSuspended = false;
-                        applyOnTop();
+                        if (onTop)
+                            raise();
+                        else
+                            applyOnTop();
                     }
+                    markUi("always_on_top");
                     ImGui::SameLine();
                     ImGui::TextDisabled("above other windows; fullscreen also above the taskbar");
                     if (silencer.supported()) {

@@ -12,7 +12,7 @@ confidence monitors, multiview spares and quick checks of what's on the network.
 - **Fullscreen** on any display, borderless; the pointer and controls appear only after the
   mouse has moved for a second (a bumped mouse shows nothing on the output) and hide 2 s after
   it stops
-- **Built for live production**: stays on top of every other window, switches OS notifications
+- **Built for live production**: stays on top of every other window (optional), switches OS notifications
   off while it runs, and its volume is the computer's own (with a choice of sound output), so
   the whole show runs from the web remote
 - **Live-safe display handling**: survives monitors being unplugged, re-plugged, rearranged or
@@ -191,7 +191,7 @@ moves to a monitor with a different scaling factor. On macOS FeedView uses insta
 
 | What | How |
 |---|---|
-| Nothing covers the output | **Always on top** (Settings, on by default): FeedView stays above other windows. When fullscreen it also checks twice a second that nothing else (the taskbar, another always-on-top program) has come over it, and moves back on top |
+| Nothing covers the output | **Always on top** (Settings, on by default): FeedView stays above other windows. When fullscreen it also checks twice a second that nothing else (the taskbar, another always-on-top program) has come over it, and moves back on top. Switch it off in FeedView's Settings, on the web remote's Settings or with Companion's *Always on top* button: then other programs can come over FeedView, also when it's fullscreen (a fullscreen command from the remote still brings it to the front once) |
 | Fullscreen from the web remote | Comes to the front even if FeedView was behind the active window or minimized, without taking the keyboard from whoever is typing on that computer (FeedView reacts to single keys) |
 | No pointer or controls over the picture by accident | The pointer and controls appear only after the mouse has been moving for a second, or on a key (R, M, Up/Down), and hide 2 s after the last input. An open menu or panel stays up to 15 s (its pointer still hides after 2 s, and comes back as soon as the mouse moves). The web remote shows when they're up and can hide them |
 | Nothing to show | **None** (first in every source list, key **0**) is a plain black output: no text, no hints, no controls unless the operator moves the mouse at the computer |
